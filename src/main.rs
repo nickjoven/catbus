@@ -43,6 +43,10 @@ enum Command {
     Show(ShowArgs),
     /// Diff two handoff packets
     Diff(DiffArgs),
+    /// Render a handoff packet as a prompt-friendly block
+    Handoff(HandoffArgs),
+    /// Validate a handoff packet against required fields
+    Validate(ValidateArgs),
     /// Garbage-collect unreferenced packet blobs (noop placeholder)
     Gc,
 }
@@ -124,6 +128,30 @@ struct DiffArgs {
     right: String,
 }
 
+#[derive(Args, Debug)]
+struct HandoffArgs {
+    /// CID of the handoff packet node
+    cid: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ValidateArgs {
+    /// CID of the handoff packet node
+    cid: String,
+
+    /// Require at least one artifact
+    #[arg(long)]
+    require_artifacts: bool,
+
+    /// Require a CDOM reference
+    #[arg(long)]
+    require_cdom: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct HandoffPacket {
     version: u32,
@@ -191,6 +219,8 @@ fn main() -> Result<()> {
         Command::List(args) => cmd_list(&ket_home, args, cli.json),
         Command::Show(args) => cmd_show(&ket_home, args, cli.json),
         Command::Diff(args) => cmd_diff(&ket_home, args, cli.json),
+        Command::Handoff(args) => cmd_handoff(&ket_home, args, cli.json),
+        Command::Validate(args) => cmd_validate(&ket_home, args, cli.json),
         Command::Gc => cmd_gc(&ket_home, cli.json),
     }
 }
@@ -418,6 +448,77 @@ fn cmd_diff(base: &PathBuf, args: DiffArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_handoff(base: &PathBuf, args: HandoffArgs, json: bool) -> Result<()> {
+    let cas = open_cas(base)?;
+    let dag = Dag::new(&cas);
+    let node = dag
+        .get_node(&Cid::from(args.cid.as_str()))
+        .context("get node")?;
+    let packet = load_packet(&cas, &node)?;
+
+    if json || args.json {
+        let payload = serde_json::json!({
+            "node_cid": args.cid,
+            "agent": node.agent,
+            "timestamp": node.timestamp,
+            "packet": packet,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("--- CATBUS HANDOFF ---");
+    println!("node: {}", args.cid);
+    println!("agent: {}", node.agent);
+    println!("timestamp: {}", node.timestamp);
+    println!("summary:");
+    println!("{}", packet.summary);
+    if let Some(cdom) = &packet.cdom {
+        println!(
+            "cdom: {} ({} files, {} symbols)",
+            cdom.cid, cdom.file_count, cdom.symbol_count
+        );
+    }
+    if !packet.artifacts.is_empty() {
+        println!("artifacts:");
+        for artifact in &packet.artifacts {
+            println!("- {} {}", artifact.name, artifact.cid);
+        }
+    }
+    println!("rules:");
+    println!("- do not recompute context already in this handoff");
+    println!("- if something is missing, request an updated handoff packet");
+    Ok(())
+}
+
+fn cmd_validate(base: &PathBuf, args: ValidateArgs, json: bool) -> Result<()> {
+    let cas = open_cas(base)?;
+    let dag = Dag::new(&cas);
+    let node = dag
+        .get_node(&Cid::from(args.cid.as_str()))
+        .context("get node")?;
+    let packet = load_packet(&cas, &node)?;
+
+    let report = validate_packet(&node, &packet, args.require_artifacts, args.require_cdom);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.ok {
+        println!("valid: {}", args.cid);
+    } else {
+        println!("invalid: {}", args.cid);
+        for err in &report.errors {
+            println!("- {err}");
+        }
+    }
+
+    if report.ok {
+        Ok(())
+    } else {
+        Err(anyhow!("handoff validation failed"))
+    }
+}
+
 fn cmd_gc(_base: &PathBuf, json: bool) -> Result<()> {
     if json {
         let payload = serde_json::json!({ "status": "noop", "reason": "not implemented" });
@@ -536,6 +637,12 @@ struct PacketDiff {
     changed: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ValidationReport {
+    ok: bool,
+    errors: Vec<String>,
+}
+
 fn diff_packets(left: &HandoffPacket, right: &HandoffPacket) -> PacketDiff {
     let left_map: BTreeMap<&str, &Cid> = left
         .artifacts
@@ -580,6 +687,42 @@ fn diff_packets(left: &HandoffPacket, right: &HandoffPacket) -> PacketDiff {
         added,
         removed,
         changed,
+    }
+}
+
+fn validate_packet(
+    node: &DagNode,
+    packet: &HandoffPacket,
+    require_artifacts: bool,
+    require_cdom: bool,
+) -> ValidationReport {
+    let mut errors = Vec::new();
+
+    if node.get_meta("catbus_packet") != Some("true") {
+        errors.push("missing catbus_packet meta on node".to_string());
+    }
+
+    if packet.summary.trim().is_empty() {
+        errors.push("summary is required".to_string());
+    }
+
+    if require_artifacts && packet.artifacts.is_empty() {
+        errors.push("at least one artifact is required".to_string());
+    }
+
+    if require_cdom && packet.cdom.is_none() {
+        errors.push("cdom is required".to_string());
+    }
+
+    if let Some(cdom) = &packet.cdom {
+        if cdom.format != "catbus.cdom.v1" {
+            errors.push(format!("unsupported cdom format: {}", cdom.format));
+        }
+    }
+
+    ValidationReport {
+        ok: errors.is_empty(),
+        errors,
     }
 }
 
@@ -697,5 +840,24 @@ mod tests {
         let bundle: CdomBundleV1 = serde_json::from_slice(&bundle_bytes).unwrap();
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.totals.files, 1);
+    }
+
+    #[test]
+    fn validation_report_errors() {
+        let node = DagNode::new(NodeKind::Context, vec![], Cid::from("abc"), "human");
+        let packet = HandoffPacket {
+            version: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            title: None,
+            summary: "  ".to_string(),
+            artifacts: Vec::new(),
+            meta: BTreeMap::new(),
+            cdom: None,
+        };
+        let report = validate_packet(&node, &packet, true, true);
+        assert!(!report.ok);
+        assert!(report.errors.iter().any(|e| e.contains("summary")));
+        assert!(report.errors.iter().any(|e| e.contains("artifact")));
+        assert!(report.errors.iter().any(|e| e.contains("cdom")));
     }
 }

@@ -39,6 +39,17 @@ cargo run -- show <node-cid>
 cargo run -- unpack <node-cid> --out-dir ./handoff
 ```
 
+## Enforce Handoffs
+Use `catbus validate` to ensure packets meet requirements, and `catbus handoff`
+to emit a prompt-friendly block. For strict enforcement, wrap agent execution
+with `scripts/catbus-guard.sh`.
+
+```sh
+cargo run -- validate <node-cid> --require-artifacts
+cargo run -- handoff <node-cid>
+CATBUS_CID=<node-cid> ./scripts/catbus-guard.sh -- your-agent-command
+```
+
 ## CDOM (optional)
 Use `--cdom` to generate a minimal CDOM bundle from provided files/dirs.
 The bundle is stored as a separate CAS blob and referenced from the packet.
