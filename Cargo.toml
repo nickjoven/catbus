@@ -16,11 +16,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 
-# Local ket path deps (swap to git deps later).
-ket-cas = { path = "../ket/ket-cas" }
-ket-dag = { path = "../ket/ket-dag" }
-ket-sql = { path = "../ket/ket-sql" }
-ket-cdom = { path = "../ket/ket-cdom" }
+# Remote ket repo deps.
+ket-cas = { git = "https://github.com/nickjoven/ket", package = "ket-cas" }
+ket-dag = { git = "https://github.com/nickjoven/ket", package = "ket-dag" }
+ket-sql = { git = "https://github.com/nickjoven/ket", package = "ket-sql" }
+ket-cdom = { git = "https://github.com/nickjoven/ket", package = "ket-cdom" }
 
 [dev-dependencies]
 tempfile = "3"

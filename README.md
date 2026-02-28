@@ -54,19 +54,11 @@ The example workflow is also published on GitHub Pages:
 https://nickjoven.github.io/catbus/
 ```
 
-## Switching ket deps to git
-Currently `Cargo.toml` uses local path dependencies:
+## ket dependency
+`Cargo.toml` uses the remote ket repo:
 ```toml
-ket-cas = { path = "../ket/ket-cas" }
-ket-dag = { path = "../ket/ket-dag" }
-ket-sql = { path = "../ket/ket-sql" }
-ket-cdom = { path = "../ket/ket-cdom" }
-```
-
-To switch to git, replace with something like:
-```toml
-ket-cas = { git = "https://github.com/<org>/ket", package = "ket-cas" }
-ket-dag = { git = "https://github.com/<org>/ket", package = "ket-dag" }
-ket-sql = { git = "https://github.com/<org>/ket", package = "ket-sql" }
-ket-cdom = { git = "https://github.com/<org>/ket", package = "ket-cdom" }
+ket-cas = { git = "https://github.com/nickjoven/ket", package = "ket-cas" }
+ket-dag = { git = "https://github.com/nickjoven/ket", package = "ket-dag" }
+ket-sql = { git = "https://github.com/nickjoven/ket", package = "ket-sql" }
+ket-cdom = { git = "https://github.com/nickjoven/ket", package = "ket-cdom" }
 ```
