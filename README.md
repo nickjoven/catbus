@@ -51,6 +51,14 @@ CATBUS_CID=<node-cid> ./scripts/catbus-guard.sh -- your-agent-command
 catbus guard --cid <node-cid> -- your-agent-command
 ```
 
+## Paste Into Agent Instructions
+```text
+You MUST consume the provided catbus handoff CID before starting work.
+Do not recompute or re-derive context already in the handoff.
+If required information is missing, request an updated handoff packet.
+At the end of your work, produce a new catbus handoff packet.
+```
+
 ## CDOM (optional)
 Use `--cdom` to generate a minimal CDOM bundle from provided files/dirs.
 The bundle is stored as a separate CAS blob and referenced from the packet.
