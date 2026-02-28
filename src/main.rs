@@ -47,6 +47,8 @@ enum Command {
     Handoff(HandoffArgs),
     /// Validate a handoff packet against required fields
     Validate(ValidateArgs),
+    /// Validate + emit handoff and then run a command
+    Guard(GuardArgs),
     /// Garbage-collect unreferenced packet blobs (noop placeholder)
     Gc,
 }
@@ -152,6 +154,25 @@ struct ValidateArgs {
     require_cdom: bool,
 }
 
+#[derive(Args, Debug)]
+struct GuardArgs {
+    /// CID of the handoff packet node (or set CATBUS_CID)
+    #[arg(long)]
+    cid: Option<String>,
+
+    /// Require at least one artifact
+    #[arg(long)]
+    require_artifacts: bool,
+
+    /// Require a CDOM reference
+    #[arg(long)]
+    require_cdom: bool,
+
+    /// Command to run after validation and handoff output
+    #[arg(last = true, trailing_var_arg = true)]
+    cmd: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct HandoffPacket {
     version: u32,
@@ -221,6 +242,7 @@ fn main() -> Result<()> {
         Command::Diff(args) => cmd_diff(&ket_home, args, cli.json),
         Command::Handoff(args) => cmd_handoff(&ket_home, args, cli.json),
         Command::Validate(args) => cmd_validate(&ket_home, args, cli.json),
+        Command::Guard(args) => cmd_guard(&ket_home, args, cli.json),
         Command::Gc => cmd_gc(&ket_home, cli.json),
     }
 }
@@ -516,6 +538,44 @@ fn cmd_validate(base: &PathBuf, args: ValidateArgs, json: bool) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("handoff validation failed"))
+    }
+}
+
+fn cmd_guard(base: &PathBuf, args: GuardArgs, json: bool) -> Result<()> {
+    let cid = if let Some(cid) = args.cid {
+        cid
+    } else if let Ok(env_cid) = std::env::var("CATBUS_CID") {
+        env_cid
+    } else {
+        return Err(anyhow!("missing CID (use --cid or set CATBUS_CID)"));
+    };
+
+    let validate_args = ValidateArgs {
+        cid: cid.clone(),
+        require_artifacts: args.require_artifacts,
+        require_cdom: args.require_cdom,
+    };
+    cmd_validate(base, validate_args, json)?;
+
+    let handoff_args = HandoffArgs {
+        cid: cid.clone(),
+        json: false,
+    };
+    cmd_handoff(base, handoff_args, json)?;
+
+    if args.cmd.is_empty() {
+        return Ok(());
+    }
+
+    let mut command = std::process::Command::new(&args.cmd[0]);
+    if args.cmd.len() > 1 {
+        command.args(&args.cmd[1..]);
+    }
+    let status = command.status().context("run guard command")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("guard command failed: {status}"))
     }
 }
 

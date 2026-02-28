@@ -48,6 +48,7 @@ with `scripts/catbus-guard.sh`.
 cargo run -- validate <node-cid> --require-artifacts
 cargo run -- handoff <node-cid>
 CATBUS_CID=<node-cid> ./scripts/catbus-guard.sh -- your-agent-command
+catbus guard --cid <node-cid> -- your-agent-command
 ```
 
 ## CDOM (optional)
