@@ -13,10 +13,20 @@ Early scaffold. Commands are functional for basic packet storage and retrieval.
 ```sh
 cargo run -- init
 cargo run -- pack --summary "handoff summary" --file path/to/file.rs
+cargo run -- pack --summary "handoff summary" --file src/lib.rs --cdom
 cargo run -- list
 cargo run -- show <node-cid>
 cargo run -- unpack <node-cid> --out-dir ./out
 cargo run -- diff <node-cid> <node-cid>
+```
+
+## CDOM (optional)
+Use `--cdom` to generate a minimal CDOM bundle from the provided files/dirs.
+The bundle is stored as a separate CAS blob and referenced from the packet.
+
+```sh
+cargo run -- pack --summary "handoff summary" --file src/lib.rs --cdom
+cargo run -- pack --summary "handoff summary" --cdom-path src/
 ```
 
 ## Switching ket deps to git

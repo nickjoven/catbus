@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use ket_cas::{Cid, Store as CasStore};
+use ket_cdom::{CdomSnapshot, Symbol};
 use ket_dag::{Dag, DagNode, NodeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,6 +79,18 @@ struct PackArgs {
     /// Metadata key=value (repeatable)
     #[arg(long)]
     meta: Vec<String>,
+
+    /// Generate a CDOM bundle from provided files/dirs
+    #[arg(long, conflicts_with = "cdom_cid")]
+    cdom: bool,
+
+    /// Additional file/dir path(s) to scan for CDOM (repeatable)
+    #[arg(long)]
+    cdom_path: Vec<PathBuf>,
+
+    /// Attach an existing CDOM bundle by CID
+    #[arg(long)]
+    cdom_cid: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -118,12 +132,45 @@ struct HandoffPacket {
     summary: String,
     artifacts: Vec<ArtifactRef>,
     meta: BTreeMap<String, String>,
+    cdom: Option<CdomRef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRef {
     name: String,
     cid: Cid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CdomRef {
+    cid: Cid,
+    format: String,
+    file_count: usize,
+    symbol_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CdomBundleV1 {
+    version: u32,
+    created_at: String,
+    generator: String,
+    files: Vec<CdomFile>,
+    totals: Totals,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CdomFile {
+    path: String,
+    language: String,
+    content_cid: Cid,
+    symbols: Vec<Symbol>,
+    symbol_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Totals {
+    files: usize,
+    symbols: usize,
 }
 
 fn main() -> Result<()> {
@@ -191,6 +238,19 @@ fn cmd_pack(base: &PathBuf, args: PackArgs, json: bool) -> Result<()> {
     let mut meta = parse_meta(&args.meta)?;
     meta.insert("catbus_packet".into(), "true".into());
 
+    let cdom = if let Some(cid) = args.cdom_cid.as_ref() {
+        Some(CdomRef {
+            cid: Cid::from(cid.as_str()),
+            format: "catbus.cdom.v1".to_string(),
+            file_count: 0,
+            symbol_count: 0,
+        })
+    } else if args.cdom || !args.cdom_path.is_empty() {
+        Some(generate_cdom_bundle(&cas, &args.file, &args.cdom_path)?)
+    } else {
+        None
+    };
+
     let packet = HandoffPacket {
         version: 1,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -198,12 +258,15 @@ fn cmd_pack(base: &PathBuf, args: PackArgs, json: bool) -> Result<()> {
         summary: args.summary.clone(),
         artifacts,
         meta,
+        cdom,
     };
 
     let packet_bytes = serde_json::to_vec_pretty(&packet)?;
     let parents: Vec<Cid> = args.parent.iter().map(|p| Cid::from(p.as_str())).collect();
-    let (node_cid, content_cid) =
-        dag.store_with_node(&packet_bytes, NodeKind::Context, parents, &args.agent)?;
+    let content_cid = cas.put(&packet_bytes)?;
+    let node = DagNode::new(NodeKind::Context, parents, content_cid.clone(), &args.agent)
+        .with_meta("catbus_packet", "true");
+    let node_cid = dag.put_node(&node)?;
 
     if json {
         let payload = serde_json::json!({
@@ -256,19 +319,26 @@ fn cmd_list(base: &PathBuf, args: ListArgs, json: bool) -> Result<()> {
             Err(_) => continue,
         };
         if node.get_meta("catbus_packet") == Some("true") {
-            results.push((cid, node));
+            let packet = load_packet(&cas, &node).ok();
+            results.push((cid, node, packet));
         }
     }
 
     if json {
         let items: Vec<_> = results
             .into_iter()
-            .map(|(cid, node)| {
+            .map(|(cid, node, packet)| {
                 serde_json::json!({
                     "node_cid": cid,
                     "output_cid": node.output_cid,
                     "agent": node.agent,
                     "timestamp": node.timestamp,
+                    "cdom": packet.and_then(|p| p.cdom).map(|c| serde_json::json!({
+                        "cid": c.cid,
+                        "format": c.format,
+                        "file_count": c.file_count,
+                        "symbol_count": c.symbol_count
+                    })),
                 })
             })
             .collect();
@@ -276,8 +346,12 @@ fn cmd_list(base: &PathBuf, args: ListArgs, json: bool) -> Result<()> {
     } else if results.is_empty() {
         println!("No packets found.");
     } else {
-        for (cid, node) in results {
-            println!("{cid}  {}  {}", node.agent, node.timestamp);
+        for (cid, node, packet) in results {
+            let cdom_hint = match packet.and_then(|p| p.cdom) {
+                Some(c) => format!(" cdom:{}f/{}s", c.file_count, c.symbol_count),
+                None => String::new(),
+            };
+            println!("{cid}  {}  {}{}", node.agent, node.timestamp, cdom_hint);
         }
     }
     Ok(())
@@ -314,6 +388,7 @@ fn cmd_diff(base: &PathBuf, args: DiffArgs, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&diff)?);
     } else {
         println!("Summary changed: {}", diff.summary_changed);
+        println!("CDOM changed: {}", diff.cdom_changed);
         if diff.title_changed {
             println!(
                 "Title: {:?} -> {:?}",
@@ -396,6 +471,12 @@ fn print_packet(node_cid: &str, node: &DagNode, packet: &HandoffPacket) {
     println!("timestamp: {}", node.timestamp);
     println!("title: {}", packet.title.as_deref().unwrap_or("(none)"));
     println!("summary: {}", packet.summary);
+    if let Some(cdom) = &packet.cdom {
+        println!(
+            "cdom: {} ({} files, {} symbols)",
+            cdom.cid, cdom.file_count, cdom.symbol_count
+        );
+    }
     if !packet.artifacts.is_empty() {
         println!("artifacts:");
         for artifact in &packet.artifacts {
@@ -447,6 +528,7 @@ fn is_safe_rel_path(path: &Path) -> bool {
 struct PacketDiff {
     summary_changed: bool,
     title_changed: bool,
+    cdom_changed: bool,
     left_title: Option<String>,
     right_title: Option<String>,
     added: Vec<String>,
@@ -492,10 +574,128 @@ fn diff_packets(left: &HandoffPacket, right: &HandoffPacket) -> PacketDiff {
     PacketDiff {
         summary_changed: left.summary != right.summary,
         title_changed: left.title != right.title,
+        cdom_changed: left.cdom.as_ref().map(|c| &c.cid) != right.cdom.as_ref().map(|c| &c.cid),
         left_title: left.title.clone(),
         right_title: right.title.clone(),
         added,
         removed,
         changed,
+    }
+}
+
+fn generate_cdom_bundle(
+    cas: &CasStore,
+    pack_files: &[PathBuf],
+    extra_paths: &[PathBuf],
+) -> Result<CdomRef> {
+    let mut scan_paths = Vec::new();
+    scan_paths.extend_from_slice(pack_files);
+    scan_paths.extend_from_slice(extra_paths);
+
+    let files = collect_scan_files(&scan_paths)?;
+    if files.is_empty() {
+        return Err(anyhow!("no supported files for CDOM scanning"));
+    }
+
+    let mut cdom_files = Vec::new();
+    let mut total_symbols = 0usize;
+
+    for file in files {
+        let snapshot = ket_cdom::scan_file(&file, cas)
+            .with_context(|| format!("scan cdom {}", file.display()))?;
+        let (cfile, count) = snapshot_to_cdom_file(snapshot);
+        total_symbols += count;
+        cdom_files.push(cfile);
+    }
+
+    let file_count = cdom_files.len();
+    let bundle = CdomBundleV1 {
+        version: 1,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generator: "catbus".to_string(),
+        files: cdom_files,
+        totals: Totals {
+            files: file_count,
+            symbols: total_symbols,
+        },
+    };
+
+    let bytes = serde_json::to_vec_pretty(&bundle)?;
+    let cid = cas.put(&bytes)?;
+
+    Ok(CdomRef {
+        cid,
+        format: "catbus.cdom.v1".to_string(),
+        file_count: bundle.totals.files,
+        symbol_count: bundle.totals.symbols,
+    })
+}
+
+fn snapshot_to_cdom_file(snapshot: CdomSnapshot) -> (CdomFile, usize) {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for sym in &snapshot.symbols {
+        let key = sym.kind.to_string();
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let symbol_count = snapshot.symbols.len();
+    (
+        CdomFile {
+            path: snapshot.file_path,
+            language: snapshot.language,
+            content_cid: snapshot.content_cid,
+            symbols: snapshot.symbols,
+            symbol_counts: counts,
+        },
+        symbol_count,
+    )
+}
+
+fn collect_scan_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_file() {
+            if ket_cdom::detect_language(path).is_some() {
+                files.push(path.to_path_buf());
+            }
+            continue;
+        }
+        if path.is_dir() {
+            for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+                let p = entry.path();
+                if p.is_file() && ket_cdom::detect_language(p).is_some() {
+                    files.push(p.to_path_buf());
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cdom_bundle_generation() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas_dir = ket_home.join("cas");
+        let cas = CasStore::init(&cas_dir).unwrap();
+
+        let rust_file = dir.path().join("lib.rs");
+        let mut f = fs::File::create(&rust_file).unwrap();
+        writeln!(f, "fn hello() {{}}").unwrap();
+
+        let cdom_ref = generate_cdom_bundle(&cas, &[rust_file.clone()], &[]).unwrap();
+        assert_eq!(cdom_ref.format, "catbus.cdom.v1");
+        assert_eq!(cdom_ref.file_count, 1);
+        assert!(cdom_ref.symbol_count >= 1);
+
+        let bundle_bytes = cas.get(&cdom_ref.cid).unwrap();
+        let bundle: CdomBundleV1 = serde_json::from_slice(&bundle_bytes).unwrap();
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.totals.files, 1);
     }
 }
