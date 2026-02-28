@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>catbus · Example Workflow</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --fg: #e7e7ea;
+        --muted: #b7bcc6;
+        --accent: #f5b700;
+        --card: #181b22;
+        --code: #11141a;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Space Grotesk", system-ui, sans-serif;
+        background: radial-gradient(1000px 600px at 20% -10%, #1a1f2a 0%, var(--bg) 60%);
+        color: var(--fg);
+        line-height: 1.5;
+      }
+      main {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 56px 24px 80px;
+      }
+      header {
+        margin-bottom: 32px;
+      }
+      h1 {
+        font-size: 40px;
+        margin: 0 0 12px;
+        letter-spacing: -0.02em;
+      }
+      p.lede {
+        font-size: 18px;
+        color: var(--muted);
+        margin: 0;
+      }
+      section {
+        background: var(--card);
+        border: 1px solid #242a34;
+        border-radius: 14px;
+        padding: 20px 22px;
+        margin: 16px 0;
+      }
+      h2 {
+        font-size: 20px;
+        margin: 0 0 10px;
+        color: var(--accent);
+      }
+      pre {
+        background: var(--code);
+        border: 1px solid #232833;
+        padding: 14px;
+        border-radius: 10px;
+        overflow-x: auto;
+        margin: 12px 0 0;
+      }
+      code {
+        font-family: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 13px;
+        color: #e8eaf0;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 14px;
+      }
+      .pill {
+        display: inline-block;
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #232833;
+        color: var(--muted);
+        margin-right: 8px;
+      }
+      footer {
+        margin-top: 24px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="pill">catbus</div>
+        <div class="pill">example workflow</div>
+        <h1>Token-Efficient Multi-Model Handoff</h1>
+        <p class="lede">
+          Store compact, content-addressed handoffs once, then reuse them across
+          models without re-sending context.
+        </p>
+      </header>
+
+      <section>
+        <h2>Scenario</h2>
+        <p>
+          You start with Model A to analyze and summarize. You want Model B to
+          continue with the exact same context, without re-explaining the entire
+          codebase or re-uploading files.
+        </p>
+      </section>
+
+      <section>
+        <h2>Workflow</h2>
+        <div class="grid">
+          <div>
+            <strong>1. Pack the handoff</strong>
+            <pre><code>cargo run -- pack \
+  --summary "API surface stabilized, next: implement X" \
+  --file src/lib.rs \
+  --cdom</code></pre>
+          </div>
+          <div>
+            <strong>2. Share the CID</strong>
+            <pre><code># copy the node CID from output
+node: &lt;node-cid&gt;</code></pre>
+          </div>
+          <div>
+            <strong>3. Rehydrate anywhere</strong>
+            <pre><code>cargo run -- show &lt;node-cid&gt;
+cargo run -- unpack &lt;node-cid&gt; --out-dir ./handoff</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>What You Save</h2>
+        <p>
+          You avoid re-sending large context across models. The handoff packet
+          and optional CDOM bundle provide a compact summary with direct links
+          to the exact artifacts.
+        </p>
+      </section>
+
+      <footer>
+        catbus stores handoffs in ket’s content-addressed store, preserving
+        provenance in the DAG and enabling reliable multi-model workflows.
+      </footer>
+    </main>
+  </body>
+</html>
