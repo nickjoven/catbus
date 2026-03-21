@@ -1,6 +1,8 @@
 # catbus
 
-CLI for multi-model handoffs with token limits, powered by `ket`.
+**Purpose:** CLI tool for multi-model context handoffs — store compact, content-addressed handoff packets so you can transfer exact context between LLMs without recompute. Built on [ket](https://github.com/nickjoven/ket).
+
+---
 
 ## Why
 If you work with multiple models, you pay a tax every time you re-explain context.
