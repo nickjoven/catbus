@@ -22,7 +22,11 @@ cargo run -- list
 cargo run -- show <node-cid>
 cargo run -- unpack <node-cid> --out-dir ./out
 cargo run -- diff <node-cid> <node-cid>
+cargo run -- stats <node-cid>      # bytes + est. tokens: handoff vs. full artifacts
 ```
+
+For the full story — context, tokens, retrieval, generation, with real output —
+see [the ket + catbus demo](https://github.com/nickjoven/ket/blob/main/docs/DEMO.md).
 
 ## Example Workflow
 1. Model A explores and summarizes the task.
@@ -39,6 +43,21 @@ cargo run -- pack \
 # Model B: retrieve handoff
 cargo run -- show <node-cid>
 cargo run -- unpack <node-cid> --out-dir ./handoff
+```
+
+## How Much It Saves
+`catbus stats` prints bytes and an estimated token count (~4 bytes/token) for the
+handoff block, the packet, the CDOM bundle and every artifact, plus the ratio.
+The handoff block also lists the packet's parent CIDs, so the consuming model can
+walk lineage (`ket dag lineage`) without being told anything else.
+
+```sh
+cargo run -- stats <node-cid>
+#                               bytes  est. tokens
+# handoff block                   619          155
+# cdom bundle                   10801         2701
+#   artifact dag.rs             31675         7919
+# handoff is 51.2x smaller than re-sending the artifacts (~4 bytes/token)
 ```
 
 ## Enforce Handoffs
