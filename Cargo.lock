@@ -411,8 +411,8 @@ dependencies = [
 
 [[package]]
 name = "ket-cas"
-version = "0.1.0"
-source = "git+https://github.com/nickjoven/ket#744646bb63595b44b75f0ef41db091ffc92f2f36"
+version = "0.2.0"
+source = "git+https://github.com/nickjoven/ket.git?tag=v0.2.0#3530ad57e5ba1e33b863afa1bb1c476c64de113d"
 dependencies = [
  "blake3",
  "serde",
@@ -421,8 +421,8 @@ dependencies = [
 
 [[package]]
 name = "ket-cdom"
-version = "0.1.0"
-source = "git+https://github.com/nickjoven/ket#744646bb63595b44b75f0ef41db091ffc92f2f36"
+version = "0.2.0"
+source = "git+https://github.com/nickjoven/ket.git?tag=v0.2.0#3530ad57e5ba1e33b863afa1bb1c476c64de113d"
 dependencies = [
  "ket-cas",
  "serde",
@@ -435,8 +435,8 @@ dependencies = [
 
 [[package]]
 name = "ket-dag"
-version = "0.1.0"
-source = "git+https://github.com/nickjoven/ket#744646bb63595b44b75f0ef41db091ffc92f2f36"
+version = "0.2.0"
+source = "git+https://github.com/nickjoven/ket.git?tag=v0.2.0#3530ad57e5ba1e33b863afa1bb1c476c64de113d"
 dependencies = [
  "base64",
  "chrono",
@@ -448,8 +448,8 @@ dependencies = [
 
 [[package]]
 name = "ket-sql"
-version = "0.1.0"
-source = "git+https://github.com/nickjoven/ket#744646bb63595b44b75f0ef41db091ffc92f2f36"
+version = "0.2.0"
+source = "git+https://github.com/nickjoven/ket.git?tag=v0.2.0#3530ad57e5ba1e33b863afa1bb1c476c64de113d"
 dependencies = [
  "chrono",
  "ket-cas",

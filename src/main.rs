@@ -49,6 +49,8 @@ enum Command {
     Validate(ValidateArgs),
     /// Validate + emit handoff and then run a command
     Guard(GuardArgs),
+    /// Report bytes and estimated tokens: handoff block vs. the full artifacts
+    Stats(StatsArgs),
     /// Garbage-collect unreferenced packet blobs (noop placeholder)
     Gc,
 }
@@ -173,6 +175,12 @@ struct GuardArgs {
     cmd: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct StatsArgs {
+    /// CID of the handoff packet node
+    cid: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct HandoffPacket {
     version: u32,
@@ -225,8 +233,7 @@ struct Totals {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -243,11 +250,12 @@ fn main() -> Result<()> {
         Command::Handoff(args) => cmd_handoff(&ket_home, args, cli.json),
         Command::Validate(args) => cmd_validate(&ket_home, args, cli.json),
         Command::Guard(args) => cmd_guard(&ket_home, args, cli.json),
+        Command::Stats(args) => cmd_stats(&ket_home, args, cli.json),
         Command::Gc => cmd_gc(&ket_home, cli.json),
     }
 }
 
-fn cmd_init(base: &PathBuf, args: InitArgs, json: bool) -> Result<()> {
+fn cmd_init(base: &Path, args: InitArgs, json: bool) -> Result<()> {
     let cas_dir = base.join("cas");
     fs::create_dir_all(base).context("create ket home")?;
     CasStore::init(&cas_dir).context("init cas")?;
@@ -276,14 +284,16 @@ fn cmd_init(base: &PathBuf, args: InitArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pack(base: &PathBuf, args: PackArgs, json: bool) -> Result<()> {
+fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
     let mut artifacts = Vec::new();
     for path in &args.file {
         let name = path_to_name(path)?;
-        let cid = cas.put_file(path).with_context(|| format!("put file {}", path.display()))?;
+        let cid = cas
+            .put_file(path)
+            .with_context(|| format!("put file {}", path.display()))?;
         artifacts.push(ArtifactRef { name, cid });
     }
 
@@ -333,7 +343,7 @@ fn cmd_pack(base: &PathBuf, args: PackArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_unpack(base: &PathBuf, args: UnpackArgs, json: bool) -> Result<()> {
+fn cmd_unpack(base: &Path, args: UnpackArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
@@ -354,7 +364,7 @@ fn cmd_unpack(base: &PathBuf, args: UnpackArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(base: &PathBuf, args: ListArgs, json: bool) -> Result<()> {
+fn cmd_list(base: &Path, args: ListArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
 
     let mut results = Vec::new();
@@ -409,7 +419,7 @@ fn cmd_list(base: &PathBuf, args: ListArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(base: &PathBuf, args: ShowArgs, json: bool) -> Result<()> {
+fn cmd_show(base: &Path, args: ShowArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
     let node = dag
@@ -425,7 +435,7 @@ fn cmd_show(base: &PathBuf, args: ShowArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_diff(base: &PathBuf, args: DiffArgs, json: bool) -> Result<()> {
+fn cmd_diff(base: &Path, args: DiffArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
@@ -470,7 +480,7 @@ fn cmd_diff(base: &PathBuf, args: DiffArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_handoff(base: &PathBuf, args: HandoffArgs, json: bool) -> Result<()> {
+fn cmd_handoff(base: &Path, args: HandoffArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
     let node = dag
@@ -483,37 +493,162 @@ fn cmd_handoff(base: &PathBuf, args: HandoffArgs, json: bool) -> Result<()> {
             "node_cid": args.cid,
             "agent": node.agent,
             "timestamp": node.timestamp,
+            "parents": node.parents,
             "packet": packet,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
-    println!("--- CATBUS HANDOFF ---");
-    println!("node: {}", args.cid);
-    println!("agent: {}", node.agent);
-    println!("timestamp: {}", node.timestamp);
-    println!("summary:");
-    println!("{}", packet.summary);
-    if let Some(cdom) = &packet.cdom {
-        println!(
-            "cdom: {} ({} files, {} symbols)",
-            cdom.cid, cdom.file_count, cdom.symbol_count
-        );
-    }
-    if !packet.artifacts.is_empty() {
-        println!("artifacts:");
-        for artifact in &packet.artifacts {
-            println!("- {} {}", artifact.name, artifact.cid);
-        }
-    }
-    println!("rules:");
-    println!("- do not recompute context already in this handoff");
-    println!("- if something is missing, request an updated handoff packet");
+    print!("{}", render_handoff(&args.cid, &node, &packet));
     Ok(())
 }
 
-fn cmd_validate(base: &PathBuf, args: ValidateArgs, json: bool) -> Result<()> {
+/// The prompt-friendly block a consuming model reads. This is the *whole*
+/// context transfer: everything else is reachable by CID from here, so its
+/// size is what a handoff costs in tokens.
+fn render_handoff(node_cid: &str, node: &DagNode, packet: &HandoffPacket) -> String {
+    let mut out = String::new();
+    out.push_str("--- CATBUS HANDOFF ---\n");
+    out.push_str(&format!("node: {node_cid}\n"));
+    out.push_str(&format!("agent: {}\n", node.agent));
+    out.push_str(&format!("timestamp: {}\n", node.timestamp));
+    if !node.parents.is_empty() {
+        out.push_str("parents:\n");
+        for parent in &node.parents {
+            out.push_str(&format!("- {parent}\n"));
+        }
+    }
+    out.push_str("summary:\n");
+    out.push_str(&format!("{}\n", packet.summary));
+    if let Some(cdom) = &packet.cdom {
+        out.push_str(&format!(
+            "cdom: {} ({} files, {} symbols)\n",
+            cdom.cid, cdom.file_count, cdom.symbol_count
+        ));
+    }
+    if !packet.artifacts.is_empty() {
+        out.push_str("artifacts:\n");
+        for artifact in &packet.artifacts {
+            out.push_str(&format!("- {} {}\n", artifact.name, artifact.cid));
+        }
+    }
+    out.push_str("rules:\n");
+    out.push_str("- do not recompute context already in this handoff\n");
+    out.push_str("- if something is missing, request an updated handoff packet\n");
+    out
+}
+
+/// Rough token estimate. Tokenizers differ per model; ~4 bytes per token is
+/// the usual rule of thumb for English prose and source code, and it is
+/// enough to show the *ratio* between a handoff and the context it replaces.
+const BYTES_PER_TOKEN: usize = 4;
+
+fn estimate_tokens(bytes: usize) -> usize {
+    bytes.div_ceil(BYTES_PER_TOKEN)
+}
+
+#[derive(Debug, Serialize)]
+struct SizeRow {
+    name: String,
+    bytes: usize,
+    est_tokens: usize,
+}
+
+impl SizeRow {
+    fn new(name: impl Into<String>, bytes: usize) -> Self {
+        SizeRow {
+            name: name.into(),
+            bytes,
+            est_tokens: estimate_tokens(bytes),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PacketStats {
+    handoff_block: SizeRow,
+    packet_json: SizeRow,
+    cdom_bundle: Option<SizeRow>,
+    artifacts: Vec<SizeRow>,
+    artifacts_total: SizeRow,
+    /// full artifacts ÷ handoff block — how many times cheaper the handoff is
+    /// than re-sending the artifacts it points to.
+    savings_ratio: f64,
+}
+
+fn cmd_stats(base: &Path, args: StatsArgs, json: bool) -> Result<()> {
+    let cas = open_cas(base)?;
+    let dag = Dag::new(&cas);
+    let node = dag
+        .get_node(&Cid::from(args.cid.as_str()))
+        .context("get node")?;
+    let packet = load_packet(&cas, &node)?;
+
+    let handoff_block = SizeRow::new(
+        "handoff block",
+        render_handoff(&args.cid, &node, &packet).len(),
+    );
+    let packet_json = SizeRow::new("packet json", cas.get(&node.output_cid)?.len());
+    let cdom_bundle = match &packet.cdom {
+        Some(cdom) => Some(SizeRow::new("cdom bundle", cas.get(&cdom.cid)?.len())),
+        None => None,
+    };
+    let mut artifacts = Vec::new();
+    for artifact in &packet.artifacts {
+        let len = cas.get(&artifact.cid)?.len();
+        artifacts.push(SizeRow::new(artifact.name.clone(), len));
+    }
+    let total_bytes: usize = artifacts.iter().map(|a| a.bytes).sum();
+    let artifacts_total = SizeRow::new("artifacts total", total_bytes);
+    let savings_ratio = if handoff_block.bytes == 0 {
+        0.0
+    } else {
+        total_bytes as f64 / handoff_block.bytes as f64
+    };
+
+    let stats = PacketStats {
+        handoff_block,
+        packet_json,
+        cdom_bundle,
+        artifacts,
+        artifacts_total,
+        savings_ratio,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    println!("{:<24} {:>10} {:>12}", "", "bytes", "est. tokens");
+    let mut rows = vec![&stats.handoff_block, &stats.packet_json];
+    if let Some(c) = &stats.cdom_bundle {
+        rows.push(c);
+    }
+    for row in rows {
+        println!("{:<24} {:>10} {:>12}", row.name, row.bytes, row.est_tokens);
+    }
+    for row in &stats.artifacts {
+        println!(
+            "{:<24} {:>10} {:>12}",
+            format!("  artifact {}", row.name),
+            row.bytes,
+            row.est_tokens
+        );
+    }
+    println!(
+        "{:<24} {:>10} {:>12}",
+        stats.artifacts_total.name, stats.artifacts_total.bytes, stats.artifacts_total.est_tokens
+    );
+    println!(
+        "handoff is {:.1}x smaller than re-sending the artifacts (~{} bytes/token)",
+        stats.savings_ratio, BYTES_PER_TOKEN
+    );
+    Ok(())
+}
+
+fn cmd_validate(base: &Path, args: ValidateArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
     let node = dag
@@ -541,7 +676,7 @@ fn cmd_validate(base: &PathBuf, args: ValidateArgs, json: bool) -> Result<()> {
     }
 }
 
-fn cmd_guard(base: &PathBuf, args: GuardArgs, json: bool) -> Result<()> {
+fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<()> {
     let cid = if let Some(cid) = args.cid {
         cid
     } else if let Ok(env_cid) = std::env::var("CATBUS_CID") {
@@ -579,7 +714,7 @@ fn cmd_guard(base: &PathBuf, args: GuardArgs, json: bool) -> Result<()> {
     }
 }
 
-fn cmd_gc(_base: &PathBuf, json: bool) -> Result<()> {
+fn cmd_gc(_base: &Path, json: bool) -> Result<()> {
     if json {
         let payload = serde_json::json!({ "status": "noop", "reason": "not implemented" });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -596,7 +731,7 @@ fn ket_dir(home: &Option<PathBuf>) -> PathBuf {
     PathBuf::from(".ket")
 }
 
-fn open_cas(base: &PathBuf) -> Result<CasStore> {
+fn open_cas(base: &Path) -> Result<CasStore> {
     let cas_dir = base.join("cas");
     Ok(CasStore::open(cas_dir)?)
 }
@@ -630,6 +765,12 @@ fn print_packet(node_cid: &str, node: &DagNode, packet: &HandoffPacket) {
     println!("node: {node_cid}");
     println!("agent: {}", node.agent);
     println!("timestamp: {}", node.timestamp);
+    if !node.parents.is_empty() {
+        println!("parents:");
+        for parent in &node.parents {
+            println!("  - {parent}");
+        }
+    }
     println!("title: {}", packet.title.as_deref().unwrap_or("(none)"));
     println!("summary: {}", packet.summary);
     if let Some(cdom) = &packet.cdom {
@@ -679,10 +820,8 @@ fn materialize_artifacts(cas: &CasStore, packet: &HandoffPacket, out_dir: &Path)
 }
 
 fn is_safe_rel_path(path: &Path) -> bool {
-    path.components().all(|c| match c {
-        std::path::Component::Normal(_) => true,
-        _ => false,
-    })
+    path.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 #[derive(Debug, Serialize)]
@@ -729,11 +868,7 @@ fn diff_packets(left: &HandoffPacket, right: &HandoffPacket) -> PacketDiff {
         match (left_map.get(name), right_map.get(name)) {
             (None, Some(_)) => added.push(name.to_string()),
             (Some(_), None) => removed.push(name.to_string()),
-            (Some(l), Some(r)) => {
-                if *l != *r {
-                    changed.push(name.to_string());
-                }
-            }
+            (Some(l), Some(r)) if *l != *r => changed.push(name.to_string()),
             _ => {}
         }
     }
@@ -891,7 +1026,7 @@ mod tests {
         let mut f = fs::File::create(&rust_file).unwrap();
         writeln!(f, "fn hello() {{}}").unwrap();
 
-        let cdom_ref = generate_cdom_bundle(&cas, &[rust_file.clone()], &[]).unwrap();
+        let cdom_ref = generate_cdom_bundle(&cas, std::slice::from_ref(&rust_file), &[]).unwrap();
         assert_eq!(cdom_ref.format, "catbus.cdom.v1");
         assert_eq!(cdom_ref.file_count, 1);
         assert!(cdom_ref.symbol_count >= 1);
@@ -900,6 +1035,40 @@ mod tests {
         let bundle: CdomBundleV1 = serde_json::from_slice(&bundle_bytes).unwrap();
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.totals.files, 1);
+    }
+
+    #[test]
+    fn token_estimate_rounds_up() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4), 1);
+        assert_eq!(estimate_tokens(5), 2);
+        assert_eq!(estimate_tokens(4000), 1000);
+    }
+
+    #[test]
+    fn handoff_block_lists_parents() {
+        let parent = Cid::from("p".repeat(64).as_str());
+        let node = DagNode::new(
+            NodeKind::Context,
+            vec![parent.clone()],
+            Cid::from("abc"),
+            "claude",
+        );
+        let packet = HandoffPacket {
+            version: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            title: None,
+            summary: "next: tests".to_string(),
+            artifacts: Vec::new(),
+            meta: BTreeMap::new(),
+            cdom: None,
+        };
+        let block = render_handoff("node", &node, &packet);
+        assert!(block.starts_with("--- CATBUS HANDOFF ---\n"));
+        assert!(block.contains(&format!("parents:\n- {parent}\n")));
+        assert!(block.contains("summary:\nnext: tests\n"));
+        assert!(block.ends_with("request an updated handoff packet\n"));
     }
 
     #[test]
