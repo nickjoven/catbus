@@ -329,6 +329,7 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let node = DagNode::new(NodeKind::Context, parents, content_cid.clone(), &args.agent)
         .with_meta("catbus_packet", "true");
     let node_cid = dag.put_node(&node)?;
+    append_log(base, "dag:create", &format!("{node_cid} (catbus pack)"))?;
 
     if json {
         let payload = serde_json::json!({
@@ -731,6 +732,36 @@ fn ket_dir(home: &Option<PathBuf>) -> PathBuf {
     PathBuf::from(".ket")
 }
 
+/// Append to ket's append-only mutation log (`<ket_home>/log`), same line
+/// format the ket CLI and MCP server write: `timestamp | event | detail`.
+/// A pack is a DAG write; if it skipped the log, `ket log` would show a
+/// history with holes in it. Guards the trailing newline like ket does
+/// (ket#18), so an interrupted prior write cannot swallow this entry.
+///
+/// TODO: replace with `ket_cas::log::append` once the pinned ket tag
+/// includes it (it landed after v0.3.0).
+fn append_log(base: &Path, event: &str, detail: &str) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let path = base.join("log");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&path)
+        .with_context(|| format!("open log {}", path.display()))?;
+    let needs_newline = file.metadata()?.len() > 0 && {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    };
+    let guard = if needs_newline { "\n" } else { "" };
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    writeln!(file, "{guard}{timestamp} | {event} | {detail}")?;
+    file.sync_data()?;
+    Ok(())
+}
+
 fn open_cas(base: &Path) -> Result<CasStore> {
     let cas_dir = base.join("cas");
     Ok(CasStore::open(cas_dir)?)
@@ -1035,6 +1066,21 @@ mod tests {
         let bundle: CdomBundleV1 = serde_json::from_slice(&bundle_bytes).unwrap();
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.totals.files, 1);
+    }
+
+    #[test]
+    fn append_log_matches_ket_format_and_heals_missing_newline() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("log");
+        fs::write(&log, "2026-01-01T00:00:00Z | put | a -> aaaa").unwrap();
+        append_log(dir.path(), "dag:create", "bbbb (catbus pack)").unwrap();
+        append_log(dir.path(), "dag:create", "cccc (catbus pack)").unwrap();
+        let text = fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "healed tail + two entries: {text:?}");
+        assert!(lines[1].ends_with("| dag:create | bbbb (catbus pack)"));
+        assert_eq!(lines[1].splitn(3, " | ").count(), 3, "ket's 3-field line");
+        assert!(text.ends_with('\n'));
     }
 
     #[test]
