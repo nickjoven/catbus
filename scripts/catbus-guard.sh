@@ -28,9 +28,14 @@ if [[ "${1:-}" == "--" ]]; then
   shift
 fi
 
-catbus validate "$cid" >/dev/null
-catbus handoff "$cid"
+# A packet with no artifacts can pass a bare `validate`; require them, so the
+# gate can actually fail (sieve audit, 2026-09-05).
+catbus validate "$cid" --require-artifacts >/dev/null
+handoff="$(catbus handoff "$cid")"
+printf '%s\n' "$handoff"
 
 if [[ "$#" -gt 0 ]]; then
+  # Hand the context to the agent, not just to this terminal.
+  export CATBUS_CID="$cid" CATBUS_HANDOFF="$handoff"
   exec "$@"
 fi

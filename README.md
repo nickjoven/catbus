@@ -72,6 +72,11 @@ CATBUS_CID=<node-cid> ./scripts/catbus-guard.sh -- your-agent-command
 catbus guard --cid <node-cid> -- your-agent-command
 ```
 
+`guard` hands the context to the command it runs, not just to your terminal:
+the child sees `CATBUS_CID`, `CATBUS_HANDOFF` (the block) and
+`CATBUS_HANDOFF_FILE`. A bare `validate` only checks that a packet is a packet;
+pass `--require-artifacts` / `--require-cdom` to make the gate able to fail.
+
 ## Paste Into Agent Instructions
 ```text
 You MUST consume the provided catbus handoff CID before starting work.
@@ -96,10 +101,10 @@ https://nickjoven.github.io/catbus/
 ```
 
 ## ket dependency
-`Cargo.toml` uses the remote ket repo:
+`Cargo.toml` pins ket by tag (see ket's STACK.md for the bump ritual):
 ```toml
-ket-cas = { git = "https://github.com/nickjoven/ket", package = "ket-cas" }
-ket-dag = { git = "https://github.com/nickjoven/ket", package = "ket-dag" }
-ket-sql = { git = "https://github.com/nickjoven/ket", package = "ket-sql" }
-ket-cdom = { git = "https://github.com/nickjoven/ket", package = "ket-cdom" }
+ket-cas  = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-cas" }
+ket-dag  = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-dag" }
+ket-sql  = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-sql" }
+ket-cdom = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-cdom" }
 ```

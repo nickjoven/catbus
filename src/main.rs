@@ -170,7 +170,8 @@ struct GuardArgs {
     #[arg(long)]
     require_cdom: bool,
 
-    /// Command to run after validation and handoff output
+    /// Command to run after validation and handoff output. It receives the
+    /// handoff as CATBUS_CID, CATBUS_HANDOFF (the block) and CATBUS_HANDOFF_FILE.
     #[arg(last = true, trailing_var_arg = true)]
     cmd: Vec<String>,
 }
@@ -678,6 +679,8 @@ fn cmd_validate(base: &Path, args: ValidateArgs, json: bool) -> Result<()> {
 }
 
 fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<()> {
+    let cas = open_cas(base)?;
+    let dag = Dag::new(&cas);
     let cid = if let Some(cid) = args.cid {
         cid
     } else if let Ok(env_cid) = std::env::var("CATBUS_CID") {
@@ -703,10 +706,24 @@ fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Hand the handoff to the agent, not just to our own stdout. The first
+    // sieve audit of this repo confirmed that guard printed the block and then
+    // exec'd the command with nothing — the "gate" gated, but transferred no
+    // context. The child now gets the CID, the block, and a file path.
+    let node = dag.get_node(&Cid::from(cid.as_str())).context("get node")?;
+    let packet = load_packet(&cas, &node)?;
+    let block = render_handoff(&cid, &node, &packet);
+    let handoff_file = std::env::temp_dir().join(format!("catbus-handoff-{}.txt", &cid[..16]));
+    fs::write(&handoff_file, &block).context("write handoff file")?;
+
     let mut command = std::process::Command::new(&args.cmd[0]);
     if args.cmd.len() > 1 {
         command.args(&args.cmd[1..]);
     }
+    command
+        .env("CATBUS_CID", &cid)
+        .env("CATBUS_HANDOFF", &block)
+        .env("CATBUS_HANDOFF_FILE", &handoff_file);
     let status = command.status().context("run guard command")?;
     if status.success() {
         Ok(())
