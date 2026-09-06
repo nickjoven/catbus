@@ -172,7 +172,7 @@ struct GuardArgs {
 
     /// Command to run after validation and handoff output. It receives the
     /// handoff as CATBUS_CID, CATBUS_HANDOFF (the block) and CATBUS_HANDOFF_FILE.
-    #[arg(last = true, trailing_var_arg = true)]
+    #[arg(last = true)]
     cmd: Vec<String>,
 }
 
@@ -1062,6 +1062,15 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// clap only checks its builder invariants in debug builds, at parse
+    /// time. Running them here turns "release works, `cargo run` panics"
+    /// into a failing test.
+    #[test]
+    fn cli_debug_assert() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn cdom_bundle_generation() {
