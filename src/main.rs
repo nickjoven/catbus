@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{ExitCode, ExitStatus};
+use tempfile::NamedTempFile;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
@@ -231,7 +233,7 @@ struct Totals {
     symbols: usize,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -241,6 +243,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ket_home = ket_dir(&cli.ket_home);
 
+    // `guard` is the one command whose exit status belongs to someone else:
+    // it relays the child's. Everything else is 0 or an error.
     match cli.command {
         Command::Init(args) => cmd_init(&ket_home, args, cli.json),
         Command::Pack(args) => cmd_pack(&ket_home, args, cli.json),
@@ -250,10 +254,11 @@ fn main() -> Result<()> {
         Command::Diff(args) => cmd_diff(&ket_home, args, cli.json),
         Command::Handoff(args) => cmd_handoff(&ket_home, args, cli.json),
         Command::Validate(args) => cmd_validate(&ket_home, args, cli.json),
-        Command::Guard(args) => cmd_guard(&ket_home, args, cli.json),
+        Command::Guard(args) => return cmd_guard(&ket_home, args, cli.json),
         Command::Stats(args) => cmd_stats(&ket_home, args, cli.json),
         Command::Gc => cmd_gc(&ket_home, cli.json),
-    }
+    }?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_init(base: &Path, args: InitArgs, json: bool) -> Result<()> {
@@ -683,7 +688,7 @@ fn cmd_validate(base: &Path, args: ValidateArgs, json: bool) -> Result<()> {
     }
 }
 
-fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<()> {
+fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<ExitCode> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
     let cid = if let Some(cid) = args.cid {
@@ -708,33 +713,86 @@ fn cmd_guard(base: &Path, args: GuardArgs, json: bool) -> Result<()> {
     cmd_handoff(base, handoff_args, json)?;
 
     if args.cmd.is_empty() {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Hand the handoff to the agent, not just to our own stdout. The first
     // sieve audit of this repo confirmed that guard printed the block and then
     // exec'd the command with nothing — the "gate" gated, but transferred no
-    // context. The child now gets the CID, the block, and a file path.
+    // context. The child now gets the CID, a private file path, and (when it
+    // fits in an environment string) the block itself.
     let node = dag.get_node(&Cid::from(cid.as_str())).context("get node")?;
     let packet = load_packet(&cas, &node)?;
     let block = render_handoff(&cid, &node, &packet);
-    let handoff_file = std::env::temp_dir().join(format!("catbus-handoff-{}.txt", &cid[..16]));
-    fs::write(&handoff_file, &block).context("write handoff file")?;
+    // Lives until the child has exited; dropped (deleted) after.
+    let handoff_file = write_handoff_file(&block)?;
 
     let mut command = std::process::Command::new(&args.cmd[0]);
-    if args.cmd.len() > 1 {
-        command.args(&args.cmd[1..]);
-    }
+    command.args(&args.cmd[1..]);
     command
         .env("CATBUS_CID", &cid)
-        .env("CATBUS_HANDOFF", &block)
-        .env("CATBUS_HANDOFF_FILE", &handoff_file);
-    let status = command.status().context("run guard command")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("guard command failed: {status}"))
+        .env("CATBUS_HANDOFF_FILE", handoff_file.path());
+    match handoff_env(&block) {
+        Some(block) => {
+            command.env("CATBUS_HANDOFF", block);
+        }
+        None => warn!(
+            "handoff block is {} bytes, above the {HANDOFF_ENV_MAX}-byte limit for CATBUS_HANDOFF; \
+             the child gets it through CATBUS_HANDOFF_FILE only",
+            block.len()
+        ),
     }
+    let status = command.status().context("run guard command")?;
+    drop(handoff_file);
+
+    if !status.success() {
+        warn!("guard command failed: {status}");
+    }
+    Ok(ExitCode::from(child_exit_code(&status)))
+}
+
+/// The handoff block is written to a fresh private temp file (`0600` on
+/// unix, unpredictable name) rather than a fixed `<tmp>/catbus-handoff-<cid>`
+/// path: no truncate-in-place race between two guards on the same CID, no
+/// world-readable context, and it is removed when the handle drops.
+fn write_handoff_file(block: &str) -> Result<NamedTempFile> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("catbus-handoff-")
+        .suffix(".txt")
+        .tempfile()
+        .context("create handoff temp file")?;
+    file.write_all(block.as_bytes())
+        .and_then(|()| file.flush())
+        .context("write handoff file")?;
+    Ok(file)
+}
+
+/// Linux caps a single environment string (`name=value`) at 128 KiB, and the
+/// whole argv+envp block at a fraction of the stack limit. A packet that
+/// passes validation must not then fail at exec with "Argument list too
+/// long", so the block only goes into `CATBUS_HANDOFF` when it is
+/// comfortably below that; `CATBUS_HANDOFF_FILE` is always set.
+const HANDOFF_ENV_MAX: usize = 64 * 1024;
+
+fn handoff_env(block: &str) -> Option<&str> {
+    (block.len() < HANDOFF_ENV_MAX).then_some(block)
+}
+
+/// Relay the child's exit status the way a shell would: its exit code when
+/// it has one, `128 + signal` when a signal killed it (unix), 1 otherwise.
+fn child_exit_code(status: &ExitStatus) -> u8 {
+    if let Some(code) = status.code() {
+        return code.clamp(0, 255) as u8;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return (128 + signal).clamp(0, 255) as u8;
+        }
+    }
+    1
 }
 
 fn cmd_gc(_base: &Path, json: bool) -> Result<()> {
@@ -1145,6 +1203,47 @@ mod tests {
             .filter(|cid| dag.get_node(cid).is_ok())
             .count();
         assert_eq!(stored, 1, "the packet node was stored despite the log failure");
+    }
+
+    #[test]
+    fn handoff_env_stays_below_the_exec_limit() {
+        let small = "x".repeat(HANDOFF_ENV_MAX - 1);
+        assert_eq!(handoff_env(&small), Some(small.as_str()));
+        let big = "x".repeat(HANDOFF_ENV_MAX);
+        assert_eq!(handoff_env(&big), None);
+    }
+
+    #[test]
+    fn handoff_file_is_private_and_removed_on_drop() {
+        let file = write_handoff_file("--- CATBUS HANDOFF ---\nnode: abc\n").unwrap();
+        let path = file.path().to_path_buf();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("catbus-handoff-") && name.ends_with(".txt"), "{name}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "--- CATBUS HANDOFF ---\nnode: abc\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "handoff file must not be group/world readable");
+        }
+        drop(file);
+        assert!(!path.exists(), "temp file removed once the child is done");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_code_relays_code_and_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child_exit_code(&ExitStatus::from_raw(0)), 0);
+        assert_eq!(child_exit_code(&ExitStatus::from_raw(7 << 8)), 7);
+        assert_eq!(child_exit_code(&ExitStatus::from_raw(255 << 8)), 255);
+        // Killed by SIGKILL (9): the shell convention is 128 + signal.
+        assert_eq!(child_exit_code(&ExitStatus::from_raw(9)), 137);
+        // SIGTERM (15).
+        assert_eq!(child_exit_code(&ExitStatus::from_raw(15)), 143);
     }
 
     #[test]

@@ -14,6 +14,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 walkdir = "2"
 
 # Remote ket repo deps.
@@ -21,6 +22,3 @@ ket-cas = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", packag
 ket-dag = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-dag" }
 ket-sql = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-sql" }
 ket-cdom = { git = "https://github.com/nickjoven/ket.git", tag = "v0.3.0", package = "ket-cdom" }
-
-[dev-dependencies]
-tempfile = "3"
