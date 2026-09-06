@@ -330,8 +330,10 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let node = DagNode::new(NodeKind::Context, parents, content_cid.clone(), &args.agent)
         .with_meta("catbus_packet", "true");
     let node_cid = dag.put_node(&node)?;
-    append_log(base, "dag:create", &format!("{node_cid} (catbus pack)"))?;
 
+    // The node is stored at this point. Print its CIDs before touching the
+    // log: a read-only or full `<ket_home>/log` must not hide a write that
+    // already happened, nor turn it into a failed command.
     if json {
         let payload = serde_json::json!({
             "node_cid": node_cid,
@@ -341,6 +343,9 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     } else {
         println!("node: {node_cid}");
         println!("content: {content_cid}");
+    }
+    if let Err(e) = append_log(base, "dag:create", &format!("{node_cid} (catbus pack)")) {
+        warn!("packet {node_cid} stored, but appending to the ket log failed: {e:#}");
     }
     Ok(())
 }
@@ -1107,6 +1112,39 @@ mod tests {
         assert!(lines[1].ends_with("| dag:create | bbbb (catbus pack)"));
         assert_eq!(lines[1].splitn(3, " | ").count(), 3, "ket's 3-field line");
         assert!(text.ends_with('\n'));
+    }
+
+    /// A pack whose ket log cannot be written still stores the node and
+    /// succeeds: the write already happened, the log is bookkeeping.
+    #[test]
+    fn pack_survives_unwritable_log() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        // A directory named `log` makes the append fail on every platform.
+        fs::create_dir(ket_home.join("log")).unwrap();
+
+        let args = PackArgs {
+            title: None,
+            summary: "log is a directory".to_string(),
+            agent: "test".to_string(),
+            parent: Vec::new(),
+            file: Vec::new(),
+            meta: Vec::new(),
+            cdom: false,
+            cdom_path: Vec::new(),
+            cdom_cid: None,
+        };
+        cmd_pack(&ket_home, args, false).unwrap();
+
+        let dag = Dag::new(&cas);
+        let stored = cas
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|cid| dag.get_node(cid).is_ok())
+            .count();
+        assert_eq!(stored, 1, "the packet node was stored despite the log failure");
     }
 
     #[test]
