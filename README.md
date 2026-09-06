@@ -37,7 +37,7 @@ see [the ket + catbus demo](https://github.com/nickjoven/ket/blob/main/docs/DEMO
 # Model A: initial analysis
 cargo run -- pack \
   --summary "API surface stabilized, next: implement X" \
-  --file src/lib.rs \
+  --file src/main.rs \
   --cdom
 
 # Model B: retrieve handoff
@@ -113,7 +113,7 @@ Use `--cdom` to generate a minimal CDOM bundle from provided files/dirs.
 The bundle is stored as a separate CAS blob and referenced from the packet.
 
 ```sh
-cargo run -- pack --summary "handoff summary" --file src/lib.rs --cdom
+cargo run -- pack --summary "handoff summary" --file src/main.rs --cdom
 cargo run -- pack --summary "handoff summary" --cdom-path src/
 ```
 
