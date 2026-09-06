@@ -603,8 +603,55 @@ struct PacketStats {
     artifacts: Vec<SizeRow>,
     artifacts_total: SizeRow,
     /// full artifacts ÷ handoff block — how many times cheaper the handoff is
-    /// than re-sending the artifacts it points to.
-    savings_ratio: f64,
+    /// than re-sending the artifacts it points to. The CDOM bundle is listed
+    /// but not counted: the handoff points at it, it does not replace it.
+    /// `None` when the packet has no artifacts to compare against.
+    savings_ratio: Option<f64>,
+}
+
+/// Blob size straight from the store's metadata; no need to read the bytes.
+fn blob_len(cas: &CasStore, cid: &Cid) -> Result<usize> {
+    let len = cas
+        .blob_size(cid)
+        .with_context(|| format!("size of {cid}"))?;
+    Ok(usize::try_from(len)?)
+}
+
+fn packet_stats(
+    cas: &CasStore,
+    node_cid: &str,
+    node: &DagNode,
+    packet: &HandoffPacket,
+) -> Result<PacketStats> {
+    let handoff_block = SizeRow::new(
+        "handoff block",
+        render_handoff(node_cid, node, packet).len(),
+    );
+    let packet_json = SizeRow::new("packet json", blob_len(cas, &node.output_cid)?);
+    let cdom_bundle = match &packet.cdom {
+        Some(cdom) => Some(SizeRow::new("cdom bundle", blob_len(cas, &cdom.cid)?)),
+        None => None,
+    };
+    let mut artifacts = Vec::new();
+    for artifact in &packet.artifacts {
+        artifacts.push(SizeRow::new(
+            artifact.name.clone(),
+            blob_len(cas, &artifact.cid)?,
+        ));
+    }
+    let total_bytes: usize = artifacts.iter().map(|a| a.bytes).sum();
+    let artifacts_total = SizeRow::new("artifacts total", total_bytes);
+    let savings_ratio = (!artifacts.is_empty() && handoff_block.bytes > 0)
+        .then(|| total_bytes as f64 / handoff_block.bytes as f64);
+
+    Ok(PacketStats {
+        handoff_block,
+        packet_json,
+        cdom_bundle,
+        artifacts,
+        artifacts_total,
+        savings_ratio,
+    })
 }
 
 fn cmd_stats(base: &Path, args: StatsArgs, json: bool) -> Result<()> {
@@ -614,37 +661,7 @@ fn cmd_stats(base: &Path, args: StatsArgs, json: bool) -> Result<()> {
         .get_node(&Cid::from(args.cid.as_str()))
         .context("get node")?;
     let packet = load_packet(&cas, &node)?;
-
-    let handoff_block = SizeRow::new(
-        "handoff block",
-        render_handoff(&args.cid, &node, &packet).len(),
-    );
-    let packet_json = SizeRow::new("packet json", cas.get(&node.output_cid)?.len());
-    let cdom_bundle = match &packet.cdom {
-        Some(cdom) => Some(SizeRow::new("cdom bundle", cas.get(&cdom.cid)?.len())),
-        None => None,
-    };
-    let mut artifacts = Vec::new();
-    for artifact in &packet.artifacts {
-        let len = cas.get(&artifact.cid)?.len();
-        artifacts.push(SizeRow::new(artifact.name.clone(), len));
-    }
-    let total_bytes: usize = artifacts.iter().map(|a| a.bytes).sum();
-    let artifacts_total = SizeRow::new("artifacts total", total_bytes);
-    let savings_ratio = if handoff_block.bytes == 0 {
-        0.0
-    } else {
-        total_bytes as f64 / handoff_block.bytes as f64
-    };
-
-    let stats = PacketStats {
-        handoff_block,
-        packet_json,
-        cdom_bundle,
-        artifacts,
-        artifacts_total,
-        savings_ratio,
-    };
+    let stats = packet_stats(&cas, &args.cid, &node, &packet)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
@@ -671,10 +688,12 @@ fn cmd_stats(base: &Path, args: StatsArgs, json: bool) -> Result<()> {
         "{:<24} {:>10} {:>12}",
         stats.artifacts_total.name, stats.artifacts_total.bytes, stats.artifacts_total.est_tokens
     );
-    println!(
-        "handoff is {:.1}x smaller than re-sending the artifacts (~{} bytes/token)",
-        stats.savings_ratio, BYTES_PER_TOKEN
-    );
+    match stats.savings_ratio {
+        Some(ratio) => println!(
+            "handoff is {ratio:.1}x smaller than re-sending the artifacts (~{BYTES_PER_TOKEN} bytes/token)"
+        ),
+        None => println!("no artifacts to compare against (~{BYTES_PER_TOKEN} bytes/token)"),
+    }
     Ok(())
 }
 
@@ -1325,6 +1344,40 @@ mod tests {
         assert_eq!(child_exit_code(&ExitStatus::from_raw(9)), 137);
         // SIGTERM (15).
         assert_eq!(child_exit_code(&ExitStatus::from_raw(15)), 143);
+    }
+
+    /// Sizes come from the store; the ratio is artifacts ÷ handoff block,
+    /// and absent when there is nothing to compare against.
+    #[test]
+    fn stats_measure_blobs_and_skip_ratio_without_artifacts() {
+        let dir = tempdir().unwrap();
+        let cas = CasStore::init(&dir.path().join("cas")).unwrap();
+        let blob = cas.put(&[b'z'; 4000]).unwrap();
+        let cdom = cas.put(b"{\"bundle\":true}").unwrap();
+
+        let packet = packet_with(vec![], Some(cdom.clone()));
+        let packet_cid = cas.put(&serde_json::to_vec(&packet).unwrap()).unwrap();
+        let node = DagNode::new(NodeKind::Context, vec![], packet_cid, "human");
+        let stats = packet_stats(&cas, "node", &node, &packet).unwrap();
+        assert_eq!(stats.savings_ratio, None);
+        assert_eq!(stats.artifacts_total.bytes, 0);
+        assert_eq!(stats.cdom_bundle.as_ref().unwrap().bytes, 15);
+
+        let packet = packet_with(
+            vec![ArtifactRef {
+                name: "z.txt".to_string(),
+                cid: blob,
+            }],
+            None,
+        );
+        let packet_cid = cas.put(&serde_json::to_vec(&packet).unwrap()).unwrap();
+        let node = DagNode::new(NodeKind::Context, vec![], packet_cid, "human");
+        let stats = packet_stats(&cas, "node", &node, &packet).unwrap();
+        assert_eq!(stats.artifacts[0].bytes, 4000);
+        assert_eq!(stats.artifacts[0].est_tokens, 1000);
+        assert_eq!(stats.artifacts_total.bytes, 4000);
+        let expected = 4000.0 / stats.handoff_block.bytes as f64;
+        assert_eq!(stats.savings_ratio, Some(expected));
     }
 
     #[test]
