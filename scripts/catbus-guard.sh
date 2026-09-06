@@ -29,13 +29,25 @@ if [[ "${1:-}" == "--" ]]; then
 fi
 
 # A packet with no artifacts can pass a bare `validate`; require them, so the
-# gate can actually fail (sieve audit, 2026-09-05).
-catbus validate "$cid" --require-artifacts >/dev/null
+# gate can actually fail (sieve audit, 2026-09-05). validate prints its
+# reasons on stdout; keep them visible without mixing them into our output.
+catbus validate "$cid" --require-artifacts 1>&2
 handoff="$(catbus handoff "$cid")"
 printf '%s\n' "$handoff"
 
 if [[ "$#" -gt 0 ]]; then
-  # Hand the context to the agent, not just to this terminal.
-  export CATBUS_CID="$cid" CATBUS_HANDOFF="$handoff"
-  exec "$@"
+  # Hand the context to the agent, not just to this terminal. The file is the
+  # channel that always works; the env var is a convenience that Linux caps
+  # (one env string < 128 KiB, so stay well under it). Not `exec`: the temp
+  # file must outlive the child and then be removed.
+  handoff_file="$(mktemp -t catbus-handoff.XXXXXXXX)"
+  trap 'rm -f "$handoff_file"' EXIT
+  printf '%s\n' "$handoff" > "$handoff_file"
+  export CATBUS_CID="$cid" CATBUS_HANDOFF_FILE="$handoff_file"
+  if (( ${#handoff} < 65536 )); then
+    export CATBUS_HANDOFF="$handoff"
+  else
+    echo "catbus-guard.sh: handoff is ${#handoff} bytes; CATBUS_HANDOFF not set, use CATBUS_HANDOFF_FILE" >&2
+  fi
+  "$@"
 fi
