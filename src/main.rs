@@ -294,6 +294,25 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
+    // Refuse dangling references before writing anything: a packet that
+    // points at a CID the store does not have would pass a presence-only
+    // check and fail later, at `stats` or on the consuming side.
+    let parents = args
+        .parent
+        .iter()
+        .map(|p| {
+            let cid = stored_cid(&cas, p, "--parent")?;
+            dag.get_node(&cid)
+                .with_context(|| format!("--parent {p}: stored, but not a DAG node"))?;
+            Ok(cid)
+        })
+        .collect::<Result<Vec<Cid>>>()?;
+    let cdom_cid = args
+        .cdom_cid
+        .as_deref()
+        .map(|c| stored_cid(&cas, c, "--cdom-cid"))
+        .transpose()?;
+
     let mut artifacts = Vec::new();
     for path in &args.file {
         let name = path_to_name(path)?;
@@ -306,9 +325,9 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let mut meta = parse_meta(&args.meta)?;
     meta.insert("catbus_packet".into(), "true".into());
 
-    let cdom = if let Some(cid) = args.cdom_cid.as_ref() {
+    let cdom = if let Some(cid) = cdom_cid {
         Some(CdomRef {
-            cid: Cid::from(cid.as_str()),
+            cid,
             format: "catbus.cdom.v1".to_string(),
             file_count: 0,
             symbol_count: 0,
@@ -330,7 +349,6 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     };
 
     let packet_bytes = serde_json::to_vec_pretty(&packet)?;
-    let parents: Vec<Cid> = args.parent.iter().map(|p| Cid::from(p.as_str())).collect();
     let content_cid = cas.put(&packet_bytes)?;
     let node = DagNode::new(NodeKind::Context, parents, content_cid.clone(), &args.agent)
         .with_meta("catbus_packet", "true");
@@ -668,7 +686,13 @@ fn cmd_validate(base: &Path, args: ValidateArgs, json: bool) -> Result<()> {
         .context("get node")?;
     let packet = load_packet(&cas, &node)?;
 
-    let report = validate_packet(&node, &packet, args.require_artifacts, args.require_cdom);
+    let report = validate_packet(
+        &cas,
+        &node,
+        &packet,
+        args.require_artifacts,
+        args.require_cdom,
+    );
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -847,6 +871,31 @@ fn open_cas(base: &Path) -> Result<CasStore> {
     Ok(CasStore::open(cas_dir)?)
 }
 
+/// A CID is 64 lowercase hex chars (BLAKE3-256). `Cid::from` accepts any
+/// string, so user-supplied references get checked here before they are
+/// written into a packet.
+fn is_well_formed_cid(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Parse a user-supplied CID and require the store to have it. `flag` names
+/// the option in the error (`--parent`, `--cdom-cid`).
+fn stored_cid(cas: &CasStore, s: &str, flag: &str) -> Result<Cid> {
+    if !is_well_formed_cid(s) {
+        return Err(anyhow!(
+            "{flag} {s}: not a CID (expected 64 lowercase hex chars)"
+        ));
+    }
+    let cid = Cid::from(s);
+    if !cas.exists(&cid) {
+        return Err(anyhow!(
+            "{flag} {s}: not in the store at {}",
+            cas.root().display()
+        ));
+    }
+    Ok(cid)
+}
+
 fn parse_meta(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     let mut meta = BTreeMap::new();
     for pair in pairs {
@@ -997,6 +1046,7 @@ fn diff_packets(left: &HandoffPacket, right: &HandoffPacket) -> PacketDiff {
 }
 
 fn validate_packet(
+    cas: &CasStore,
     node: &DagNode,
     packet: &HandoffPacket,
     require_artifacts: bool,
@@ -1006,6 +1056,31 @@ fn validate_packet(
 
     if node.get_meta("catbus_packet") != Some("true") {
         errors.push("missing catbus_packet meta on node".to_string());
+    }
+
+    // Presence is not enough: every CID the packet hands to the next model
+    // has to resolve in this store, or `unpack`/`stats` fail after the gate
+    // said yes.
+    for parent in &node.parents {
+        if !cas.exists(parent) {
+            errors.push(format!("parent {parent} is missing from the store"));
+        }
+    }
+    for artifact in &packet.artifacts {
+        if !cas.exists(&artifact.cid) {
+            errors.push(format!(
+                "artifact {} ({}) is missing from the store",
+                artifact.name, artifact.cid
+            ));
+        }
+    }
+    if let Some(cdom) = &packet.cdom {
+        if !cas.exists(&cdom.cid) {
+            errors.push(format!(
+                "cdom bundle {} is missing from the store",
+                cdom.cid
+            ));
+        }
     }
 
     if packet.summary.trim().is_empty() {
@@ -1202,7 +1277,10 @@ mod tests {
             .into_iter()
             .filter(|cid| dag.get_node(cid).is_ok())
             .count();
-        assert_eq!(stored, 1, "the packet node was stored despite the log failure");
+        assert_eq!(
+            stored, 1,
+            "the packet node was stored despite the log failure"
+        );
     }
 
     #[test]
@@ -1218,7 +1296,10 @@ mod tests {
         let file = write_handoff_file("--- CATBUS HANDOFF ---\nnode: abc\n").unwrap();
         let path = file.path().to_path_buf();
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("catbus-handoff-") && name.ends_with(".txt"), "{name}");
+        assert!(
+            name.starts_with("catbus-handoff-") && name.ends_with(".txt"),
+            "{name}"
+        );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "--- CATBUS HANDOFF ---\nnode: abc\n"
@@ -1282,6 +1363,8 @@ mod tests {
 
     #[test]
     fn validation_report_errors() {
+        let dir = tempdir().unwrap();
+        let cas = CasStore::init(&dir.path().join("cas")).unwrap();
         let node = DagNode::new(NodeKind::Context, vec![], Cid::from("abc"), "human");
         let packet = HandoffPacket {
             version: 1,
@@ -1292,10 +1375,151 @@ mod tests {
             meta: BTreeMap::new(),
             cdom: None,
         };
-        let report = validate_packet(&node, &packet, true, true);
+        let report = validate_packet(&cas, &node, &packet, true, true);
         assert!(!report.ok);
         assert!(report.errors.iter().any(|e| e.contains("summary")));
         assert!(report.errors.iter().any(|e| e.contains("artifact")));
         assert!(report.errors.iter().any(|e| e.contains("cdom")));
+    }
+
+    fn packet_with(artifacts: Vec<ArtifactRef>, cdom: Option<Cid>) -> HandoffPacket {
+        HandoffPacket {
+            version: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            title: None,
+            summary: "refs".to_string(),
+            artifacts,
+            meta: BTreeMap::new(),
+            cdom: cdom.map(|cid| CdomRef {
+                cid,
+                format: "catbus.cdom.v1".to_string(),
+                file_count: 0,
+                symbol_count: 0,
+            }),
+        }
+    }
+
+    /// A packet whose parent, artifact or cdom CID is not in the store fails
+    /// validation and says which; the same packet with real blobs passes.
+    #[test]
+    fn validation_reports_dangling_references() {
+        let dir = tempdir().unwrap();
+        let cas = CasStore::init(&dir.path().join("cas")).unwrap();
+        let dangling = Cid::from("d".repeat(64).as_str());
+
+        let node = DagNode::new(
+            NodeKind::Context,
+            vec![dangling.clone()],
+            Cid::from("abc"),
+            "human",
+        )
+        .with_meta("catbus_packet", "true");
+        let packet = packet_with(
+            vec![ArtifactRef {
+                name: "lib.rs".to_string(),
+                cid: dangling.clone(),
+            }],
+            Some(dangling.clone()),
+        );
+        let report = validate_packet(&cas, &node, &packet, true, true);
+        assert!(!report.ok);
+        assert_eq!(report.errors.len(), 3, "{:?}", report.errors);
+        assert!(report.errors[0].starts_with(&format!("parent {dangling}")));
+        assert!(report.errors[1].starts_with("artifact lib.rs ("));
+        assert!(report.errors[2].starts_with(&format!("cdom bundle {dangling}")));
+
+        let real = cas.put(b"real blob").unwrap();
+        let node = DagNode::new(
+            NodeKind::Context,
+            vec![real.clone()],
+            Cid::from("abc"),
+            "human",
+        )
+        .with_meta("catbus_packet", "true");
+        let packet = packet_with(
+            vec![ArtifactRef {
+                name: "lib.rs".to_string(),
+                cid: real.clone(),
+            }],
+            Some(real),
+        );
+        let report = validate_packet(&cas, &node, &packet, true, true);
+        assert!(report.ok, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn cid_well_formedness() {
+        assert!(is_well_formed_cid(&"a".repeat(64)));
+        assert!(is_well_formed_cid(&"0".repeat(64)));
+        assert!(!is_well_formed_cid("deadbeef"));
+        assert!(
+            !is_well_formed_cid(&"A".repeat(64)),
+            "uppercase is not a CID"
+        );
+        assert!(!is_well_formed_cid(&"g".repeat(64)));
+        assert!(!is_well_formed_cid(&"a".repeat(65)));
+    }
+
+    /// `pack` refuses malformed and dangling `--cdom-cid` / `--parent` up
+    /// front, and stores nothing when it does.
+    #[test]
+    fn pack_rejects_malformed_and_dangling_references() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        let pack = |parent: Vec<String>, cdom_cid: Option<String>| {
+            cmd_pack(
+                &ket_home,
+                PackArgs {
+                    title: None,
+                    summary: "refs".to_string(),
+                    agent: "test".to_string(),
+                    parent,
+                    file: Vec::new(),
+                    meta: Vec::new(),
+                    cdom: false,
+                    cdom_path: Vec::new(),
+                    cdom_cid,
+                },
+                false,
+            )
+        };
+
+        let err = pack(vec![], Some("deadbeef".to_string())).unwrap_err();
+        assert!(
+            err.to_string().contains("--cdom-cid deadbeef: not a CID"),
+            "{err:#}"
+        );
+
+        let missing = "e".repeat(64);
+        let err = pack(vec![], Some(missing.clone())).unwrap_err();
+        assert!(err.to_string().contains("not in the store"), "{err:#}");
+        let err = pack(vec![missing.clone()], None).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("--parent {missing}: not in the store")),
+            "{err:#}"
+        );
+
+        // A blob that exists but is not a node cannot be a parent either.
+        let blob = cas.put(b"not a node").unwrap();
+        let err = pack(vec![blob.to_string()], None).unwrap_err();
+        assert!(err.to_string().contains("not a DAG node"), "{err:#}");
+        assert_eq!(
+            cas.list().unwrap(),
+            vec![blob.clone()],
+            "nothing was written"
+        );
+
+        // A real packet node is a fine parent, and an existing blob a fine cdom.
+        pack(vec![], None).unwrap();
+        let dag = Dag::new(&cas);
+        let node_cid = cas
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| dag.get_node(c).is_ok())
+            .unwrap();
+        pack(vec![node_cid.to_string()], Some(blob.to_string())).unwrap();
     }
 }
