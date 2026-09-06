@@ -309,6 +309,12 @@ struct Packed {
 /// twice yields the same `content_cid` (the node CIDs still differ by their
 /// timestamps).
 fn build_and_store_packet(base: &Path, args: &PackArgs) -> Result<Packed> {
+    // A packet whose summary is empty would mint successfully and then be
+    // rejected by catbus's own `validate`; refuse it here instead.
+    if args.summary.trim().is_empty() {
+        return Err(anyhow!("--summary must not be empty"));
+    }
+
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
@@ -330,6 +336,17 @@ fn build_and_store_packet(base: &Path, args: &PackArgs) -> Result<Packed> {
         .as_deref()
         .map(|c| stored_cid(&cas, c, "--cdom-cid"))
         .transpose()?;
+    // A `--cdom-cid` must point at a bundle catbus actually wrote, not any blob
+    // that happens to be in the store: load it and require it to parse as the
+    // CDOM bundle shape. Otherwise the packet advertises a "cdom" that later
+    // reads (and `validate --require-cdom`) cannot make sense of.
+    if let Some(cid) = &cdom_cid {
+        let bytes = cas
+            .get(cid)
+            .with_context(|| format!("--cdom-cid {cid}: read bundle"))?;
+        serde_json::from_slice::<CdomBundleV1>(&bytes)
+            .with_context(|| format!("--cdom-cid {cid}: not a catbus CDOM bundle"))?;
+    }
 
     let mut artifacts = Vec::new();
     for path in &args.file {
@@ -1015,7 +1032,15 @@ fn parse_meta(pairs: &[String]) -> Result<BTreeMap<String, String>> {
 
 fn load_packet(cas: &CasStore, node: &DagNode) -> Result<HandoffPacket> {
     let bytes = cas.get(&node.output_cid)?;
-    let packet: HandoffPacket = serde_json::from_slice(&bytes)?;
+    // A node whose content is not a handoff packet (e.g. one created by
+    // `ket dag create`) should say so, not leak a raw serde message like
+    // "expected value at line 1 column 1".
+    let packet: HandoffPacket = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "{} is not a catbus packet (its content is not a handoff packet)",
+            node.output_cid
+        )
+    })?;
     Ok(packet)
 }
 
@@ -1654,7 +1679,8 @@ mod tests {
             "nothing was written"
         );
 
-        // A real packet node is a fine parent, and an existing blob a fine cdom.
+        // A real packet node is a fine parent, and a real CDOM bundle a fine
+        // cdom. An arbitrary blob is *not* a fine cdom (see the dedicated test).
         pack(vec![], None).unwrap();
         let dag = Dag::new(&cas);
         let node_cid = cas
@@ -1663,7 +1689,98 @@ mod tests {
             .into_iter()
             .find(|c| dag.get_node(c).is_ok())
             .unwrap();
-        pack(vec![node_cid.to_string()], Some(blob.to_string())).unwrap();
+        let bundle = generate_cdom_bundle(&cas, &[], &[rust_source(dir.path())]).unwrap();
+        pack(vec![node_cid.to_string()], Some(bundle.cid.to_string())).unwrap();
+    }
+
+    /// C4: an empty or whitespace-only summary is refused at pack time (catbus's
+    /// own `validate` would otherwise reject the packet it just minted), and
+    /// nothing is written.
+    #[test]
+    fn pack_rejects_empty_summary() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        for s in ["", "   ", "\t\n"] {
+            let err = cmd_pack(&ket_home, pack_args(s), false).unwrap_err();
+            assert!(
+                err.to_string().contains("summary must not be empty"),
+                "{err:#}"
+            );
+        }
+        assert!(cas.list().unwrap().is_empty(), "nothing was written");
+    }
+
+    /// C4: a `--cdom-cid` pointing at a blob that is not a CDOM bundle is
+    /// rejected at pack time with a clear message, and nothing is written.
+    #[test]
+    fn pack_rejects_cdom_cid_that_is_not_a_bundle() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        let blob = cas.put(b"not a bundle").unwrap();
+
+        let mut args = pack_args("refs");
+        args.cdom_cid = Some(blob.to_string());
+        let err = cmd_pack(&ket_home, args, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not a catbus CDOM bundle"),
+            "{err:#}"
+        );
+        assert_eq!(cas.list().unwrap(), vec![blob], "nothing new was written");
+
+        // A real bundle is accepted.
+        let bundle = generate_cdom_bundle(&cas, &[], &[rust_source(dir.path())]).unwrap();
+        let mut args = pack_args("refs");
+        args.cdom_cid = Some(bundle.cid.to_string());
+        cmd_pack(&ket_home, args, false).unwrap();
+    }
+
+    /// C4: `validate`/`stats`/`diff` on a node whose content is not a packet
+    /// (e.g. one from `ket dag create`) report "not a catbus packet" rather than
+    /// leaking a raw serde message.
+    #[test]
+    fn commands_on_non_packet_node_give_clear_error() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        let dag = Dag::new(&cas);
+        let content = cas.put(b"just some text, not a packet").unwrap();
+        let node = DagNode::new(NodeKind::Context, vec![], content, "human");
+        let node_cid = dag.put_node(&node).unwrap();
+        let cid = node_cid.to_string();
+
+        let validate = cmd_validate(
+            &ket_home,
+            ValidateArgs {
+                cid: cid.clone(),
+                require_artifacts: false,
+                require_cdom: false,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            validate.to_string().contains("not a catbus packet"),
+            "{validate:#}"
+        );
+
+        let stats = cmd_stats(&ket_home, StatsArgs { cid: cid.clone() }, false).unwrap_err();
+        assert!(
+            stats.to_string().contains("not a catbus packet"),
+            "{stats:#}"
+        );
+
+        let diff = cmd_diff(
+            &ket_home,
+            DiffArgs {
+                left: cid.clone(),
+                right: cid,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(diff.to_string().contains("not a catbus packet"), "{diff:#}");
     }
 
     /// Write a scannable Rust file and return its path (for CDOM bundles).
