@@ -784,13 +784,24 @@ fn cmd_stats(base: &Path, args: StatsArgs, json: bool) -> Result<()> {
         "{:<24} {:>10} {:>12}",
         stats.artifacts_total.name, stats.artifacts_total.bytes, stats.artifacts_total.est_tokens
     );
-    match stats.savings_ratio {
-        Some(ratio) => println!(
+    println!("{}", savings_line(stats.savings_ratio));
+    Ok(())
+}
+
+/// The one-line verdict under the size table. `savings_ratio` is
+/// artifacts ÷ handoff block: above 1.0 the handoff is genuinely cheaper than
+/// re-sending the artifacts; at 1.0 or below it is not, so say that truthfully
+/// instead of printing a bogus "0.0x smaller".
+fn savings_line(savings_ratio: Option<f64>) -> String {
+    match savings_ratio {
+        None => format!("no artifacts to compare against (~{BYTES_PER_TOKEN} bytes/token)"),
+        Some(ratio) if ratio > 1.0 => format!(
             "handoff is {ratio:.1}x smaller than re-sending the artifacts (~{BYTES_PER_TOKEN} bytes/token)"
         ),
-        None => println!("no artifacts to compare against (~{BYTES_PER_TOKEN} bytes/token)"),
+        Some(ratio) => format!(
+            "handoff is not smaller than the artifacts it points to (they are only {ratio:.1}x its size) (~{BYTES_PER_TOKEN} bytes/token)"
+        ),
     }
-    Ok(())
 }
 
 fn cmd_validate(base: &Path, args: ValidateArgs, json: bool) -> Result<()> {
@@ -1957,5 +1968,22 @@ mod tests {
             .filter(|c| dag.get_node(c).is_ok())
             .count();
         assert_eq!(stored, 2, "both packet nodes are stored without a Dolt db");
+    }
+
+    /// C2-x1: the verdict line is truthful when the handoff is not smaller than
+    /// the artifacts (ratio <= 1) — no bogus "0.0x smaller".
+    #[test]
+    fn savings_line_is_truthful() {
+        let big = savings_line(Some(3.0));
+        assert!(big.contains("3.0x smaller than re-sending"), "{big}");
+
+        let low = savings_line(Some(0.4));
+        assert!(low.contains("not smaller"), "{low}");
+        assert!(!low.contains("smaller than re-sending"), "{low}");
+
+        let one = savings_line(Some(1.0));
+        assert!(one.contains("not smaller"), "{one}");
+
+        assert!(savings_line(None).contains("no artifacts to compare"));
     }
 }
