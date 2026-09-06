@@ -69,20 +69,36 @@ cargo run -- stats <node-cid>
 
 ## Enforce Handoffs
 Use `catbus validate` to ensure packets meet requirements, and `catbus handoff`
-to emit a prompt-friendly block. For strict enforcement, wrap agent execution
-with `scripts/catbus-guard.sh`.
+to emit a prompt-friendly block. To gate an agent on a handoff, wrap its
+execution with `catbus guard` or `scripts/catbus-guard.sh`.
 
 ```sh
 cargo run -- validate <node-cid> --require-artifacts
 cargo run -- handoff <node-cid>
+catbus guard --cid <node-cid> --require-artifacts -- your-agent-command
 CATBUS_CID=<node-cid> ./scripts/catbus-guard.sh -- your-agent-command
-catbus guard --cid <node-cid> -- your-agent-command
 ```
 
-`guard` hands the context to the command it runs, not just to your terminal:
-the child sees `CATBUS_CID`, `CATBUS_HANDOFF` (the block) and
-`CATBUS_HANDOFF_FILE`. A bare `validate` only checks that a packet is a packet;
-pass `--require-artifacts` / `--require-cdom` to make the gate able to fail.
+A bare `validate` checks that the node is a catbus packet with a summary, that
+its CDOM format is known, and that every CID it references (parents, artifacts,
+CDOM bundle) exists in the store. Pass `--require-artifacts` / `--require-cdom`
+to also demand that those be present at all.
+
+Both guards validate, print the block, then run the command with the context in
+its environment, not just on your terminal. They differ in what they enforce:
+
+| | `catbus guard` | `scripts/catbus-guard.sh` |
+|---|---|---|
+| validation | bare `validate`; `--require-artifacts` / `--require-cdom` are opt-in | always `validate --require-artifacts` (reasons go to stderr) |
+| `CATBUS_CID` | set | set |
+| `CATBUS_HANDOFF_FILE` | always: a private temp file (0600), removed after the command exits | always: a `mktemp` file, removed on exit |
+| `CATBUS_HANDOFF` (the block) | only when the block is under 64 KiB | only when the block is under 64 KiB |
+| exit status | the command's (128 + signal if it was killed) | the command's |
+
+The 64 KiB cutoff keeps a large packet from failing at exec with "Argument list
+too long" (Linux caps one environment string at 128 KiB); read
+`CATBUS_HANDOFF_FILE` when `CATBUS_HANDOFF` is unset. The script needs `catbus`
+on `PATH`.
 
 ## Paste Into Agent Instructions
 ```text

@@ -172,8 +172,9 @@ struct GuardArgs {
     #[arg(long)]
     require_cdom: bool,
 
-    /// Command to run after validation and handoff output. It receives the
-    /// handoff as CATBUS_CID, CATBUS_HANDOFF (the block) and CATBUS_HANDOFF_FILE.
+    /// Command to run after validation and handoff output. It receives
+    /// CATBUS_CID, CATBUS_HANDOFF_FILE (always) and CATBUS_HANDOFF (the block,
+    /// only when it is under 64 KiB), and its exit status is relayed.
     #[arg(last = true)]
     cmd: Vec<String>,
 }
