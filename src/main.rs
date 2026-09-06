@@ -185,10 +185,12 @@ struct StatsArgs {
     cid: String,
 }
 
+/// The content-addressed handoff blob. It is a pure function of its inputs:
+/// no wall-clock time lives here, so packing the same context twice dedups to
+/// one content CID. Provenance time lives on the DAG node (`node.timestamp`).
 #[derive(Debug, Serialize, Deserialize)]
 struct HandoffPacket {
     version: u32,
-    created_at: String,
     title: Option<String>,
     summary: String,
     artifacts: Vec<ArtifactRef>,
@@ -210,10 +212,12 @@ struct CdomRef {
     symbol_count: usize,
 }
 
+/// The content-addressed CDOM bundle. Like `HandoffPacket`, it carries no
+/// wall-clock time: scanning the same files twice must dedup to one bundle CID,
+/// which in turn keeps the packet that points at it deterministic.
 #[derive(Debug, Serialize, Deserialize)]
 struct CdomBundleV1 {
     version: u32,
-    created_at: String,
     generator: String,
     files: Vec<CdomFile>,
     totals: Totals,
@@ -291,7 +295,18 @@ fn cmd_init(base: &Path, args: InitArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
+/// A sealed packet: the content blob CID and the DAG node CID.
+struct Packed {
+    node_cid: Cid,
+    content_cid: Cid,
+}
+
+/// Validate the inputs, write the artifacts + packet blob + node to CAS, and
+/// return the sealed CIDs. This is the pure content path: no printing, no log.
+/// Because the packet blob carries no wall-clock time, packing the same inputs
+/// twice yields the same `content_cid` (the node CIDs still differ by their
+/// timestamps).
+fn build_and_store_packet(base: &Path, args: &PackArgs) -> Result<Packed> {
     let cas = open_cas(base)?;
     let dag = Dag::new(&cas);
 
@@ -341,7 +356,6 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
 
     let packet = HandoffPacket {
         version: 1,
-        created_at: chrono::Utc::now().to_rfc3339(),
         title: args.title.clone(),
         summary: args.summary.clone(),
         artifacts,
@@ -354,6 +368,18 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let node = DagNode::new(NodeKind::Context, parents, content_cid.clone(), &args.agent)
         .with_meta("catbus_packet", "true");
     let node_cid = dag.put_node(&node)?;
+
+    Ok(Packed {
+        node_cid,
+        content_cid,
+    })
+}
+
+fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
+    let Packed {
+        node_cid,
+        content_cid,
+    } = build_and_store_packet(base, &args)?;
 
     // The node is stored at this point. Print its CIDs before touching the
     // log: a read-only or full `<ket_home>/log` must not hide a write that
@@ -388,7 +414,10 @@ fn cmd_unpack(base: &Path, args: UnpackArgs, json: bool) -> Result<()> {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&packet)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&packet_json_with_time(&node, &packet)?)?
+        );
     } else {
         print_packet(&args.cid, &node, &packet);
     }
@@ -459,7 +488,10 @@ fn cmd_show(base: &Path, args: ShowArgs, json: bool) -> Result<()> {
     let packet = load_packet(&cas, &node)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&packet)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&packet_json_with_time(&node, &packet)?)?
+        );
     } else {
         print_packet(&args.cid, &node, &packet);
     }
@@ -941,6 +973,21 @@ fn load_packet(cas: &CasStore, node: &DagNode) -> Result<HandoffPacket> {
     Ok(packet)
 }
 
+/// Render a packet as JSON for `show`/`unpack`, re-attaching the provenance
+/// time from the node. The time is not stored in the content-addressed packet
+/// blob (so identical packs dedup), but callers still expect a `created_at` in
+/// the output.
+fn packet_json_with_time(node: &DagNode, packet: &HandoffPacket) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(packet)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "created_at".to_string(),
+            serde_json::Value::String(node.timestamp.clone()),
+        );
+    }
+    Ok(value)
+}
+
 fn print_packet(node_cid: &str, node: &DagNode, packet: &HandoffPacket) {
     println!("node: {node_cid}");
     println!("agent: {}", node.agent);
@@ -1155,7 +1202,6 @@ fn generate_cdom_bundle(
     let file_count = cdom_files.len();
     let bundle = CdomBundleV1 {
         version: 1,
-        created_at: chrono::Utc::now().to_rfc3339(),
         generator: "catbus".to_string(),
         files: cdom_files,
         totals: Totals {
@@ -1401,7 +1447,6 @@ mod tests {
         );
         let packet = HandoffPacket {
             version: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
             title: None,
             summary: "next: tests".to_string(),
             artifacts: Vec::new(),
@@ -1422,7 +1467,6 @@ mod tests {
         let node = DagNode::new(NodeKind::Context, vec![], Cid::from("abc"), "human");
         let packet = HandoffPacket {
             version: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
             title: None,
             summary: "  ".to_string(),
             artifacts: Vec::new(),
@@ -1439,7 +1483,6 @@ mod tests {
     fn packet_with(artifacts: Vec<ArtifactRef>, cdom: Option<Cid>) -> HandoffPacket {
         HandoffPacket {
             version: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
             title: None,
             summary: "refs".to_string(),
             artifacts,
@@ -1575,5 +1618,90 @@ mod tests {
             .find(|c| dag.get_node(c).is_ok())
             .unwrap();
         pack(vec![node_cid.to_string()], Some(blob.to_string())).unwrap();
+    }
+
+    /// Write a scannable Rust file and return its path (for CDOM bundles).
+    fn rust_source(dir: &Path) -> PathBuf {
+        let path = dir.join("lib.rs");
+        fs::write(&path, "fn hello() {}\n").unwrap();
+        path
+    }
+
+    /// C1: the packet blob is content-addressed on its inputs alone. Packing the
+    /// same context twice must dedup to one content CID (so `diff` reports no
+    /// change); provenance time lives on the node, whose CID still differs.
+    #[test]
+    fn pack_dedups_identical_inputs() {
+        use std::time::Duration;
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        CasStore::init(&ket_home.join("cas")).unwrap();
+        fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let args = || PackArgs {
+            title: Some("t".to_string()),
+            summary: "same inputs".to_string(),
+            agent: "test".to_string(),
+            parent: Vec::new(),
+            file: vec![dir.path().join("a.txt")],
+            meta: vec!["k=v".to_string()],
+            cdom: false,
+            cdom_path: Vec::new(),
+            cdom_cid: None,
+        };
+
+        let a = build_and_store_packet(&ket_home, &args()).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let b = build_and_store_packet(&ket_home, &args()).unwrap();
+
+        assert_eq!(
+            a.content_cid, b.content_cid,
+            "identical inputs must dedup to one content blob"
+        );
+
+        let cas = open_cas(&ket_home).unwrap();
+        let dag = Dag::new(&cas);
+        let na = dag.get_node(&a.node_cid).unwrap();
+        let nb = dag.get_node(&b.node_cid).unwrap();
+        assert_ne!(
+            na.timestamp, nb.timestamp,
+            "the wall-clock time lives on the node, so the two nodes still differ"
+        );
+        let left = load_packet(&cas, &na).unwrap();
+        let right = load_packet(&cas, &nb).unwrap();
+        let diff = diff_packets(&left, &right);
+        assert!(!diff.summary_changed && !diff.title_changed && !diff.cdom_changed);
+        assert!(diff.added.is_empty() && diff.removed.is_empty() && diff.changed.is_empty());
+    }
+
+    /// C1 (same class): a CDOM bundle is content-addressed too, so scanning the
+    /// same file twice dedups to one bundle CID.
+    #[test]
+    fn cdom_bundle_is_deterministic() {
+        let dir = tempdir().unwrap();
+        let cas = CasStore::init(&dir.path().join("cas")).unwrap();
+        let src = rust_source(dir.path());
+        let first = generate_cdom_bundle(&cas, std::slice::from_ref(&src), &[]).unwrap();
+        let second = generate_cdom_bundle(&cas, std::slice::from_ref(&src), &[]).unwrap();
+        assert_eq!(first.cid, second.cid, "same scan inputs must dedup");
+    }
+
+    /// C1: time still shows in the human `handoff`/`show` output and in the
+    /// `show`/`unpack` JSON — sourced from the node, not the packet blob.
+    #[test]
+    fn display_paths_render_node_timestamp() {
+        let node = DagNode::new(NodeKind::Context, vec![], Cid::from("abc"), "human")
+            .with_meta("catbus_packet", "true");
+        let packet = HandoffPacket {
+            version: 1,
+            title: None,
+            summary: "s".to_string(),
+            artifacts: Vec::new(),
+            meta: BTreeMap::new(),
+            cdom: None,
+        };
+        let block = render_handoff("node", &node, &packet);
+        assert!(block.contains(&format!("timestamp: {}", node.timestamp)));
+        let value = packet_json_with_time(&node, &packet).unwrap();
+        assert_eq!(value["created_at"], serde_json::json!(node.timestamp));
     }
 }
