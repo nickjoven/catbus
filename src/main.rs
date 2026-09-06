@@ -295,10 +295,12 @@ fn cmd_init(base: &Path, args: InitArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// A sealed packet: the content blob CID and the DAG node CID.
+/// A sealed packet: the content blob CID, the DAG node CID, and the node
+/// itself (needed to mirror the node to Dolt after the write).
 struct Packed {
     node_cid: Cid,
     content_cid: Cid,
+    node: DagNode,
 }
 
 /// Validate the inputs, write the artifacts + packet blob + node to CAS, and
@@ -372,6 +374,7 @@ fn build_and_store_packet(base: &Path, args: &PackArgs) -> Result<Packed> {
     Ok(Packed {
         node_cid,
         content_cid,
+        node,
     })
 }
 
@@ -379,11 +382,13 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
     let Packed {
         node_cid,
         content_cid,
+        node,
     } = build_and_store_packet(base, &args)?;
 
     // The node is stored at this point. Print its CIDs before touching the
-    // log: a read-only or full `<ket_home>/log` must not hide a write that
-    // already happened, nor turn it into a failed command.
+    // side mirrors: a read-only or full `<ket_home>/log`, or an absent or
+    // locked Dolt db, must not hide a write that already happened, nor turn it
+    // into a failed command.
     if json {
         let payload = serde_json::json!({
             "node_cid": node_cid,
@@ -394,9 +399,50 @@ fn cmd_pack(base: &Path, args: PackArgs, json: bool) -> Result<()> {
         println!("node: {node_cid}");
         println!("content: {content_cid}");
     }
+
+    // Keep ket's own SQL projection in step with the write, exactly as
+    // `ket dag create` does. Without it the node is absent from `dag_nodes` and
+    // its parent edges are missing from `dag_edges` until a manual `ket repair`,
+    // leaving `ket verify-projection` dirty. Best-effort: the node is already
+    // sealed in CAS, so a missing or locked Dolt db warns, it does not fail.
+    if let Err(e) = project_node_to_dolt(base, &node_cid, &node) {
+        warn!("packet {node_cid} stored, but projecting it to Dolt failed: {e:#}");
+    }
     if let Err(e) = append_log(base, "dag:create", &format!("{node_cid} (catbus pack)")) {
         warn!("packet {node_cid} stored, but appending to the ket log failed: {e:#}");
     }
+    Ok(())
+}
+
+/// Mirror a freshly-sealed node to the Dolt SQL projection, exactly as ket's
+/// own `dag create` does: the node row plus one edge per parent, derived from
+/// the sealed node's `parent_links()`. A no-op when no Dolt db is present.
+/// Idempotent — ket-sql uses `INSERT IGNORE`, so re-running a pack does not
+/// double-write.
+fn project_node_to_dolt(base: &Path, node_cid: &Cid, node: &DagNode) -> Result<()> {
+    let db_path = base.join("ket.db");
+    if !db_path.join(".dolt").exists() {
+        // No SQL mirror to keep in sync (init ran with --no-sql, or dolt was
+        // unavailable). Nothing to do; not a failure.
+        return Ok(());
+    }
+    let db = ket_sql::DoltDb::open(db_path).context("open dolt db")?;
+    let parent_refs: Vec<(&str, i32, &str)> = node
+        .parent_links()
+        .enumerate()
+        .map(|(i, (cid, kind))| (cid.as_str(), i as i32, kind.as_str()))
+        .collect();
+    db.sync_dag_node(
+        node_cid.as_str(),
+        &node.kind.to_string(),
+        &node.agent,
+        &node.timestamp,
+        node.output_cid.as_str(),
+        "",
+        &parent_refs,
+        node.schema_cid.as_ref().map(|c| c.as_str()),
+    )
+    .context("sync dag node to dolt")?;
     Ok(())
 }
 
@@ -1703,5 +1749,96 @@ mod tests {
         assert!(block.contains(&format!("timestamp: {}", node.timestamp)));
         let value = packet_json_with_time(&node, &packet).unwrap();
         assert_eq!(value["created_at"], serde_json::json!(node.timestamp));
+    }
+
+    fn pack_args(summary: &str) -> PackArgs {
+        PackArgs {
+            title: None,
+            summary: summary.to_string(),
+            agent: "test".to_string(),
+            parent: Vec::new(),
+            file: Vec::new(),
+            meta: Vec::new(),
+            cdom: false,
+            cdom_path: Vec::new(),
+            cdom_cid: None,
+        }
+    }
+
+    /// C7: `pack` mirrors the node and its parent edges to Dolt, so ket's own
+    /// `verify-projection` stays clean and the packet node is in `dag_nodes`
+    /// with no manual `ket repair`. Real Dolt; skipped only if dolt is absent.
+    #[test]
+    fn pack_projects_node_and_edges_to_dolt() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        CasStore::init(&ket_home.join("cas")).unwrap();
+        if ket_sql::DoltDb::init(&ket_home.join("ket.db")).is_err() {
+            eprintln!("dolt unavailable; skipping projection test");
+            return;
+        }
+
+        // A root packet, then a child linking to it: the child's parent edge is
+        // exactly the projection a plain CAS+log pack used to leave missing.
+        cmd_pack(&ket_home, pack_args("root"), false).unwrap();
+        let cas = open_cas(&ket_home).unwrap();
+        let dag = Dag::new(&cas);
+        let root_cid = cas
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| dag.get_node(c).is_ok())
+            .unwrap();
+
+        let mut child = pack_args("child");
+        child.parent = vec![root_cid.to_string()];
+        cmd_pack(&ket_home, child, false).unwrap();
+        let child_cid = cas
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| {
+                dag.get_node(c)
+                    .map(|n| !n.parents.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap();
+
+        let status = std::process::Command::new("ket")
+            .args(["verify-projection", "--home"])
+            .arg(&ket_home)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "verify-projection must be clean after pack"
+        );
+
+        let db = ket_sql::DoltDb::open(ket_home.join("ket.db")).unwrap();
+        assert!(
+            db.dag_node_exists(child_cid.as_str()).unwrap(),
+            "packet node must be in dag_nodes"
+        );
+    }
+
+    /// C7: with no Dolt db present the projection is a no-op and `pack` still
+    /// succeeds — the node is sealed in CAS regardless.
+    #[test]
+    fn pack_without_dolt_still_succeeds() {
+        let dir = tempdir().unwrap();
+        let ket_home = dir.path().join(".ket");
+        let cas = CasStore::init(&ket_home.join("cas")).unwrap();
+        let packed = build_and_store_packet(&ket_home, &pack_args("no dolt")).unwrap();
+        // No ket.db: projecting is a clean no-op, not an error.
+        project_node_to_dolt(&ket_home, &packed.node_cid, &packed.node).unwrap();
+        cmd_pack(&ket_home, pack_args("no dolt too"), false).unwrap();
+        let dag = Dag::new(&cas);
+        let stored = cas
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|c| dag.get_node(c).is_ok())
+            .count();
+        assert_eq!(stored, 2, "both packet nodes are stored without a Dolt db");
     }
 }
